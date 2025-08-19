@@ -627,16 +627,31 @@ def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, colo
     m.save(output_html)
     print(f"[MAP] {os.path.abspath(output_html)}")
 
-def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
-    """Q-테이블을 이용해 롤아웃으로 상위 경로를 순차적으로 탐색"""
-    banned: set[Tuple[Tuple[str, str], ...]] = set()
+def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95):
+    """Q-테이블을 이용해 롤아웃으로 상위 경로를 순차적으로 탐색.
+
+    Args:
+        env: 환경 인스턴스
+        agent: 학습된 에이전트(Q-테이블)
+        k: 상위 몇 개의 경로를 추출할지
+        n_samples: 각 순위에서 시도할 샘플 수
+        tau: softmax 온도 파라미터(탐색 다양성 조절)
+        tau_decay: 순위가 올라갈수록 tau를 줄이고 싶을 때 사용하는 감소율
+
+    tau는 기본적으로 1.0으로 두어 분포가 지나치게 뾰족해지지 않도록 했으며,
+    순위가 올라갈수록 tau를 곱셈 형태로 감소시켜 점차적으로 더욱 확실한
+    선택을 하게 된다.
+    """
+    banned: set[Tuple[str, ...]] = set()
     top: List[Tuple[float, List[Tuple[str, str]]]] = []
     colors = [
         "blue", "red", "green", "purple", "orange",
         "darkred", "lightblue", "black", "lightgreen", "gray",
     ]
     print("\n[RL-Policy] 상위 경로 (순차적 제거, 비용 기준):")
-    for rank in range(1, k + 1):
+    rank = 1
+    current_tau = tau
+    while len(top) < k:
         results: List[Tuple[float, List[Tuple[str, str]]]] = []
         for _ in range(n_samples):
             s = env.reset()
@@ -647,30 +662,50 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
                 part_name = env.ready[env.cursor]
                 cand = env.cand_by_part.get(s, [])
                 if len(cand) == 0:
-                    probs = torch.softmax(agent.q[s] / tau, dim=0).numpy()
+                    probs = torch.softmax(agent.q[s] / current_tau, dim=0).numpy()
                     a = int(np.random.choice(np.arange(env.num_fac), p=probs))
                 else:
-                    q_row = agent.q[s, cand] / tau
+                    q_row = agent.q[s, cand] / current_tau
                     probs = torch.softmax(q_row, dim=0).numpy()
                     a = int(np.random.choice(cand, p=probs))
                 s, r, done = env.step(a)
                 plan.append((part_name, env.fac_ids[a]))
                 total_reward += r
-            key = tuple(plan)
-            if key in banned:
+            path_key = tuple(fac_id for _, fac_id in plan)
+            if path_key in banned:
                 continue
             cost = -total_reward  # 비용 = -보상 합
             results.append((cost, plan))
-        unique: Dict[Tuple[Tuple[str, str], ...], float] = {}
+        unique: Dict[Tuple[str, ...], Tuple[float, List[Tuple[str, str]]]] = {}
         for cost, plan in results:
-            key = tuple(plan)
-            if key not in unique or cost < unique[key]:
-                unique[key] = cost
+            key = tuple(fac_id for _, fac_id in plan)
+            if key not in unique or cost < unique[key][0]:
+                unique[key] = (cost, plan)
         if not unique:
-            break
-        best_key = min(unique, key=unique.get)
-        best_cost = unique[best_key]
-        best_plan = list(best_key)
+            # 샘플링으로 새로운 경로가 없으면 무작위로라도 생성
+            for _ in range(1000):
+                s = env.reset()
+                done = False
+                plan: List[Tuple[str, str]] = []
+                total_reward = 0.0
+                while not done:
+                    part_name = env.ready[env.cursor]
+                    cand = env.cand_by_part.get(s, [])
+                    if len(cand) == 0:
+                        a = int(np.random.randint(env.num_fac))
+                    else:
+                        a = int(np.random.choice(cand))
+                    s, r, done = env.step(a)
+                    plan.append((part_name, env.fac_ids[a]))
+                    total_reward += r
+                key = tuple(fac_id for _, fac_id in plan)
+                if key not in banned:
+                    unique[key] = (-total_reward, plan)
+                    break
+            if not unique:
+                break
+        best_key = min(unique, key=lambda k: unique[k][0])
+        best_cost, best_plan = unique[best_key]
         banned.add(best_key)
         top.append((best_cost, best_plan))
         print(f" {rank}위: {best_cost:.2f}")
@@ -681,6 +716,8 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
         out_html = os.path.join(os.path.dirname(MBOM_PATH), f"plan_route_top{rank}.html")
         color = colors[(rank - 1) % len(colors)]
         visualize_plan_route(best_plan, env, out_html, color=color)
+        rank += 1
+        current_tau *= tau_decay
     return top
 
 
@@ -703,4 +740,4 @@ def write_production_plans(assignments: List[Tuple[str,str]], template: str|None
 # 예시 저장 (템플릿 없으면 None)
 OUTPUT_XML = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans.xml")
 write_production_plans(assignments, template=None, output=OUTPUT_XML)
-rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25)
+rollout_topk_with_rl(env, agent, k=10)
