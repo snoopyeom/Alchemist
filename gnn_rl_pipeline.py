@@ -1,248 +1,539 @@
-"""GNN 기반 공정-설비 매칭과 강화학습 전역 최적화 파이프라인."""
+# -*- coding: utf-8 -*-
+"""
+Hybrid pipeline:
+- Robust parsing (MBOM/AAS)
+- Geocoding (Kakao)
+- Hetero graph (part/fac + travel/start_at/to_assembly)
+- Homogeneous conversion for GraphSAGE
+- Q-learning global assignment
+- ProductionPlans.xml writer
+"""
 
 from __future__ import annotations
-
-import math
-import os
-import xml.etree.ElementTree as ET
+import os, re, time, math, xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import SAGEConv
 
-# 1. M-BOM과 AAS XML 파싱 ----------------------------------------------------
+# =========================================================
+# 0) PATHS: relative-first; AAS falls back to absolute
+# =========================================================
+def resolve_paths():
+    try:
+        BASE = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        BASE = os.getcwd()
+    mbom_rel = os.path.join(BASE, "mbom_250721.xml")
+    aas_rel  = os.path.join(BASE, "AAS_all")
+    aas_abs  = r"C:\Users\tlsgm\Desktop\산자부과제\8월_산자부\AAS_v1\AAS_all"
 
+    if not os.path.isfile(mbom_rel):
+        raise FileNotFoundError(f"[ERROR] MBOM not found: {mbom_rel}")
+    if os.path.isdir(aas_rel):
+        aas_dir = aas_rel
+    elif os.path.isdir(aas_abs):
+        aas_dir = aas_abs
+    else:
+        raise FileNotFoundError(f"[ERROR] AAS folder not found:\n- {aas_rel}\n- {aas_abs}")
+    print(f"[PATH] MBOM : {os.path.normpath(mbom_rel)}")
+    print(f"[PATH] AAS  : {os.path.normpath(aas_dir)}")
+    return os.path.normpath(mbom_rel), os.path.normpath(aas_dir)
 
-def parse_mbom(xml_path: str) -> pd.DataFrame:
-    """M-BOM XML에서 공정 정보를 추출한다.
+MBOM_PATH, AAS_DIR = resolve_paths()
 
-    Parameters
-    ----------
-    xml_path: str
-        M-BOM XML 경로.
-    """
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    processes = []
-    for proc in root.findall('.//Process'):
-        processes.append(
-            {
-                'id': proc.get('id', ''),
-                'type': proc.findtext('Type', default=''),
-                'detail': proc.findtext('Detail', default=''),
-            }
-        )
-    return pd.DataFrame(processes)
+# =========================================================
+# 1) MBOM parsing (robust)
+# =========================================================
+def parse_mbom_tree(xml_path: str) -> ET.Element:
+    return ET.parse(xml_path).getroot()
 
+def parse_processes(root: ET.Element) -> pd.DataFrame:
+    out = []
+    for proc in root.findall(".//Process"):
+        pid = proc.attrib.get("id")
+        get = lambda t: proc.findtext(t)
+        estimates = proc.find("Estimates")
+        def _to_float(s): 
+            try: return float(s) if s is not None else None
+            except: return None
+        time_v = _to_float(estimates.findtext("Time")) if estimates is not None else None
+        cost_v = _to_float(estimates.findtext("Cost")) if estimates is not None else None
+        co2_v  = _to_float(estimates.findtext("CarbonEmission")) if estimates is not None else None
+        comp_id = None
+        comp_id_elem = proc.find(".//Component/ID")
+        if comp_id_elem is not None: comp_id = (comp_id_elem.text or "").strip() or None
+        out.append({
+            "id": pid,
+            "type": get("Type") or "",
+            "detail": get("Detail") or "",
+            "material": get("Material") or "",
+            "component_id": comp_id,
+            "time": time_v, "cost": cost_v, "co2": co2_v,
+        })
+    return pd.DataFrame(out)
 
-def parse_aas(folder: str) -> pd.DataFrame:
-    """폴더 내 AAS XML을 순회하며 설비 정보를 모은다."""
-    facilities: List[Dict[str, str]] = []
+MBOM_ROOT = parse_mbom_tree(MBOM_PATH)
+df_proc = parse_processes(MBOM_ROOT)
+
+# =========================================================
+# 2) AAS parsing (robust Property/MultiLanguageProperty)
+# =========================================================
+def _local_name(tag: str) -> str:
+    if not tag: return ""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+def _child_text(elem: ET.Element, child_local: str):
+    if elem is None: return None
+    for ch in elem:
+        if _local_name(ch.tag) == child_local:
+            return (ch.text or "").strip() if ch.text else None
+    return None
+
+def _iter_all_properties(root: ET.Element):
+    for elem in root.iter():
+        ln = _local_name(elem.tag)
+        if ln == "Property":
+            k = _child_text(elem, "idShort")
+            v = _child_text(elem, "value")
+            if k and v is not None:
+                yield k.strip(), v.strip()
+        elif ln == "MultiLanguageProperty":
+            k = _child_text(elem, "idShort")
+            if not k: continue
+            v_text = None
+            v_node = next((c for c in elem if _local_name(c.tag)=="value"), None)
+            if v_node is not None:
+                for ls in v_node.iter():
+                    if ls is not None and ls.text and ls.text.strip():
+                        v_text = ls.text.strip(); break
+            if v_text is not None:
+                yield k.strip(), v_text
+
+def _pick_first(info: dict, keys: List[str], default="N/A"):
+    for k in keys:
+        if k in info and info[k] not in (None,"","N/A"): return info[k]
+    return default
+
+LOCATION_KEYS   = ["Location","주소","소재지","위치","loc","LOCATION"]
+ASSETID_KEYS    = ["AssetID","assetId","ID","Identifier","AssetCode","장비ID"]
+ASSETTYPE_KEYS  = ["AssetType","assetType","Type","AssetCategory","장비타입"]
+MFR_KEYS        = ["ManufacturerName","Manufacturer","Maker","제조사","Vendor","브랜드"]
+
+def parse_aas_folder(folder: str) -> Tuple[pd.DataFrame, List[Tuple[str,str]]]:
+    rows, failed = [], []
     for fname in os.listdir(folder):
-        if not fname.endswith('.xml'):
-            continue
-        path = os.path.join(folder, fname)
-        tree = ET.parse(path)
-        root = tree.getroot()
-        facilities.append(
-            {
-                'id': root.findtext('.//AssetID', default=fname),
-                'type': root.findtext('.//AssetType', default=''),
-                'location': root.findtext('.//Location', default=''),
-            }
-        )
-    return pd.DataFrame(facilities)
+        if not fname.lower().endswith(".xml"): continue
+        fpath = os.path.join(folder, fname)
+        try:
+            root = ET.parse(fpath).getroot()
+            info = {k:v for k,v in _iter_all_properties(root)}
+            rows.append({
+                "AssetID": _pick_first(info, ASSETID_KEYS, default=fname.replace(".xml","")),
+                "AssetType": _pick_first(info, ASSETTYPE_KEYS),
+                "Location": _pick_first(info, LOCATION_KEYS, default="N/A"),
+                "ManufacturerName": _pick_first(info, MFR_KEYS),
+                "FileName": fname,
+            })
+        except Exception as e:
+            failed.append((fname, str(e)))
+    return pd.DataFrame(rows).fillna("N/A"), failed
 
+df_aas, failed_files = parse_aas_folder(AAS_DIR)
 
-# 2. 그래프 구성 ----------------------------------------------------------------
+# =========================================================
+# 3) Geocoding (Kakao) + address cleaning
+# =========================================================
+KAKAO_API_KEY = "ac473e33b35d06d474e45ab59d2b69d0"  # TODO: put your key
+def clean_address(addr: str) -> str:
+    if addr is None or pd.isna(addr): return ""
+    s = str(addr).strip()
+    if s in ("","N/A"): return ""
+    for pat, repl in [
+        (r"\(.*?\)", ""), (r"\d+호.*", ""), (r"\s*시화공단.*", ""),
+        (r"/\d+", ""), (r"\s+[가-힣0-9]+산업단지.*$", "")
+    ]:
+        s = re.sub(pat, repl, s)
+    return re.sub(r"\s{2,}", " ", s).strip()
 
-def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Haversine 공식을 이용해 두 좌표 간 거리를 km 단위로 계산."""
-    r = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlon / 2) ** 2
-    )
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return r * c
+def kakao_geocode(address: str, api_key: str, max_retries=2, pause=0.25):
+    if not address: return (None, None)
+    url = "https://dapi.kakao.com/v2/local/search/address.json"
+    headers = {"Authorization": f"KakaoAK {api_key}"}
+    params = {"query": address}
+    for a in range(max_retries+1):
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=5)
+            if r.status_code == 200:
+                docs = r.json().get("documents", [])
+                return (float(docs[0]["y"]), float(docs[0]["x"])) if docs else (None, None)
+            time.sleep(pause * (2 if r.status_code==429 else 1) * (a+1))
+        except requests.exceptions.Timeout:
+            time.sleep(pause*(a+1))
+        except Exception:
+            break
+    return (None, None)
 
+import requests
+cache, lats, lons = {}, [], []
+for raw in df_aas["Location"]:
+    q = clean_address(raw)
+    if q in cache:
+        lat, lon = cache[q]
+    else:
+        lat, lon = kakao_geocode(q, KAKAO_API_KEY)
+        if q: cache[q] = (lat, lon)
+        time.sleep(0.2)
+    lats.append(lat); lons.append(lon)
+df_aas["Latitude"], df_aas["Longitude"] = lats, lons
 
-def build_graph(processes: pd.DataFrame, facilities: pd.DataFrame,
-                geocode: Dict[str, Tuple[float, float]]) -> Tuple[Data, Dict[Tuple[int, int], float]]:
-    """공정과 설비 노드, 거리 기반 엣지를 생성한다.
+# =========================================================
+# 4) Hetero graph (part/fac + edges)
+# =========================================================
+# Parts (scenario)
+PARTS = ["Supporter","Bracket","Shaft","Washer","Bush","Sheet"]
+SCENARIO_TYPE = {
+    "Supporter":"절삭","Bracket":"절삭","Shaft":"절삭",
+    "Washer":"적층제조","Bush":"적층제조","Sheet":"적층제조",
+}
 
-    Parameters
-    ----------
-    processes: pd.DataFrame
-        공정 DataFrame.
-    facilities: pd.DataFrame
-        설비 DataFrame.
-    geocode: dict
-        {location: (lat, lon)} 형태의 좌표 사전. 외부 API 호출을 피하기 위한
-        미리 계산된 좌표를 전달한다.
-    Returns
-    -------
-    data: torch_geometric.data.Data
-        노드 및 엣지가 포함된 그래프 데이터.
-    dist_map: dict
-        (proc_idx, fac_idx) -> 거리(km) 매핑.
-    """
-    # 노드 특징: 공정/설비 구분 one-hot
-    num_proc = len(processes)
-    num_fac = len(facilities)
-    x = torch.zeros((num_proc + num_fac, 2), dtype=torch.float)
-    x[:num_proc, 0] = 1.0  # 공정
-    x[num_proc:, 1] = 1.0  # 설비
+# Facility typing by text cue
+fac = df_aas.dropna(subset=["Latitude","Longitude"]).copy()
+fac["AssetID"] = fac["AssetID"].astype(str)
+lat = fac["Latitude"].astype(float).to_numpy()
+lon = fac["Longitude"].astype(float).to_numpy()
 
-    edge_index: List[List[int]] = [[], []]
-    edge_attr: List[float] = []
-    dist_map: Dict[Tuple[int, int], float] = {}
+fac_type = pd.Series("미분류", index=fac.index, dtype=str)
+if "ManufacturerName" in fac.columns:
+    fac_type[fac["ManufacturerName"].astype(str).str.strip().eq("건솔루션")] = "조립"
+TXT = fac.fillna("").astype(str).agg(" ".join, axis=1).str.upper()
+MAP = {
+    "적층제조": r"(FDM|PBF|3D\s*PRINT|적층|ADDITIVE)",
+    "절삭"   : r"(CNC|MILL|밀링|선반|LATHE|절삭|다이캐스팅|MACHINING|머시닝)",
+    "프레스" : r"(PRESS|프레스|성형|FINEBLANKING)",
+}
+for lab, pat in MAP.items():
+    mask = (fac_type=="미분류") & TXT.str.contains(pat, regex=True)
+    fac_type[mask] = lab
+fac["fac_type"] = fac_type
 
-    for i, proc in processes.iterrows():
-        for j, fac in facilities.iterrows():
-            if proc['type'] not in fac['type']:
-                continue
-            lat1, lon1 = geocode.get(proc.get('location', ''), (0.0, 0.0))
-            lat2, lon2 = geocode.get(fac['location'], (0.0, 0.0))
-            dist = _haversine(lat1, lon1, lat2, lon2)
-            edge_index[0].append(i)
-            edge_index[1].append(num_proc + j)
-            edge_attr.append(dist)
-            dist_map[(i, j)] = dist
+def haversine(lat1, lon1, lat2, lon2):
+    R=6371.0088
+    dlat = np.radians(lat2-lat1); dlon = np.radians(lon2-lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
+    return R*2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
 
-    data = Data(
-        x=x,
-        edge_index=torch.tensor(edge_index, dtype=torch.long),
-        edge_attr=torch.tensor(edge_attr).view(-1, 1),
-    )
-    return data, dist_map
+# fac↔fac KNN travel edges
+K = max(1, min(5, len(fac)-1))
+D = haversine(lat[:,None], lon[:,None], lat[None,:], lon[None,:])
+np.fill_diagonal(D, np.inf)
+nn_idx = np.argpartition(D, K, axis=1)[:, :K]
 
+edges_ff, attrs_ff = [], []
+for i in range(len(fac)):
+    for j in nn_idx[i]:
+        if i==j: continue
+        dkm = float(D[i,j]); tmin = (dkm/40.0)*60.0
+        edges_ff += [[i,j],[j,i]]
+        attrs_ff  += [[dkm,tmin],[dkm,tmin]]
 
-# 3. GraphSAGE 모델 ------------------------------------------------------------
+# part→first facility (type/subtype rules)
+type_to_idx = {t: np.where((fac["fac_type"]==t).values)[0] for t in sorted(fac["fac_type"].unique())}
+_text_cols = [c for c in ["AssetType","ManufacturerName","FileName","Location","AssetID"] if c in fac.columns]
+TXT_FAC = fac[_text_cols].fillna("").astype(str).agg(" ".join, axis=1).str.upper()
+PART_SUBTYPE_PREF = {"Supporter": r"(MILL|MILLING|밀링)\b", "Bracket": r"(MILL|MILLING|밀링)\b",
+                     "Shaft": r"(LATHE|TURN|선반)\b", "Washer": r"\bFDM\b", "Bush": r"\bFDM\b", "Sheet": r"\bFDM\b"}
+PART_SUBTYPE_AVOID = {"Washer": r"\bPBF\b", "Bush": r"\bPBF\b", "Sheet": r"\bPBF\b"}
+PART_TYPE_SECONDARY = {"Supporter":"절삭","Bracket":"절삭","Shaft":"적층제조","Washer":"적층제조","Bush":"적층제조","Sheet":"적층제조"}
 
+def _apply_subtype_preference(cand_idx, part_name):
+    if len(cand_idx)==0: return cand_idx, False
+    want = PART_SUBTYPE_PREF.get(part_name)
+    avoid = PART_SUBTYPE_AVOID.get(part_name)
+    if want:
+        sel = [i for i in cand_idx if re.search(want, TXT_FAC.iloc[i])]
+        if len(sel)>0: return np.array(sel, dtype=int), True
+    if avoid:
+        sel = [i for i in cand_idx if not re.search(avoid, TXT_FAC.iloc[i])]
+        if len(sel)>0: return np.array(sel, dtype=int), False
+    return cand_idx, False
 
+edges_pf, dbg_rows, chosen = [], [], {}  # chosen[part_idx] = facility_idx
+part_id2idx = {nm:i for i,nm in enumerate(PARTS)}
+for p in PARTS:
+    t = SCENARIO_TYPE[p]
+    tried = [t]
+    cand = type_to_idx.get(t, np.array([], dtype=int))
+    if len(cand)==0 and p in PART_TYPE_SECONDARY:
+        t2 = PART_TYPE_SECONDARY[p]; tried.append(t2)
+        cand = type_to_idx.get(t2, np.array([], dtype=int))
+    cand_pref, matched = _apply_subtype_preference(cand, p)
+    if len(cand_pref)==0:
+        lat0, lon0 = float(np.nanmean(lat)), float(np.nanmean(lon))
+        j_first = int(np.argmin(haversine(lat0, lon0, lat, lon)))
+        dkm = float(np.min(haversine(lat0, lon0, lat, lon)))
+    else:
+        lat0, lon0 = float(np.mean(lat[cand_pref])), float(np.mean(lon[cand_pref]))
+        dists = haversine(lat0, lon0, lat[cand_pref], lon[cand_pref])
+        j_first = int(cand_pref[np.argmin(dists)]); dkm = float(np.min(dists))
+    i_part = part_id2idx[p]
+    chosen[i_part] = j_first
+    edges_pf.append([i_part, j_first])
+    rowj = fac.iloc[j_first]
+    dbg_rows.append({
+        "Part": p, "StartType": tried[-1], "SubtypePrefMatched": bool(matched),
+        "Candidates_total(type)": int(len(cand)), "Candidates_after_pref": int(len(cand_pref)),
+        "ChosenFacility": rowj["AssetID"], "fac_type(Chosen)": rowj.get("fac_type",""),
+        "AssetType(Chosen)": rowj.get("AssetType",""), "Dist_km_to_center": round(dkm,3),
+    })
+
+# fac→assembly (to_assembly)
+asm_idx = np.where(fac["fac_type"]=="조립")[0]
+edges_fa, attrs_fa = [], []
+if len(asm_idx)>0:
+    for i in range(len(fac)):
+        d = haversine(lat[i], lon[i], lat[asm_idx], lon[asm_idx])
+        j = int(asm_idx[np.argmin(d)])
+        dkm = float(np.min(d)); tmin = (dkm/40.0)*60.0
+        edges_fa.append([i, j]); attrs_fa.append([dkm, tmin])
+
+# Hetero graph object (for inspection/debug; model uses homogeneous below)
+hetero = HeteroData()
+hetero["fac"].x  = torch.tensor(np.c_[lat,lon], dtype=torch.float32)
+hetero["part"].x = torch.eye(len(PARTS), dtype=torch.float32)
+hetero[("fac","travel","fac")].edge_index = torch.tensor(edges_ff, dtype=torch.long).t().contiguous()
+hetero[("fac","travel","fac")].edge_attr  = torch.tensor(attrs_ff, dtype=torch.float32)
+hetero[("part","start_at","fac")].edge_index = torch.tensor(edges_pf, dtype=torch.long).t().contiguous()
+if edges_fa:
+    hetero[("fac","to_assembly","fac")].edge_index = torch.tensor(edges_fa, dtype=torch.long).t().contiguous()
+    hetero[("fac","to_assembly","fac")].edge_attr  = torch.tensor(attrs_fa, dtype=torch.float32)
+
+# =========================================================
+# 5) Convert to homogeneous (for GraphSAGE)
+#    - nodes: [parts..., fac...]
+#    - features: [is_part, is_fac, lat_z, lon_z] (parts have zeros in lat/lon)
+#    - edges: travel (fac-fac), start_at (part->fac), to_assembly (fac->fac)
+# =========================================================
+num_part = len(PARTS)
+num_fac  = len(fac)
+# features
+lat_z = (lat - np.nanmean(lat)) / (np.nanstd(lat) + 1e-6)
+lon_z = (lon - np.nanmean(lon)) / (np.nanstd(lon) + 1e-6)
+x_part = np.c_[np.ones((num_part,1)), np.zeros((num_part,1)), np.zeros((num_part,1)), np.zeros((num_part,1))]
+x_fac  = np.c_[np.zeros((num_fac,1)), np.ones((num_fac,1)), lat_z[:,None], lon_z[:,None]]
+X = torch.tensor(np.vstack([x_part, x_fac]), dtype=torch.float32)
+
+# edges
+def shift_fac(i): return num_part + i
+E = []
+# part->fac (training label edges)
+pf_src = [s for s, _ in edges_pf]
+pf_dst = [shift_fac(t) for _, t in edges_pf]
+E += list(zip(pf_src, pf_dst))
+# fac-fac travel
+ff = [(shift_fac(s), shift_fac(t)) for s,t in edges_ff]
+E += ff
+# fac->assembly
+fa = [(shift_fac(s), shift_fac(t)) for s,t in edges_fa]
+E += fa
+edge_index = torch.tensor(np.array(E).T, dtype=torch.long)
+
+# labels for part->fac edges: positives are chosen; negatives are other candidates
+edge_label_index = []
+edge_label = []
+# build candidate sets by type for negatives
+type_to_idx_list = type_to_idx  # already mapping to indices
+for i_part, p in enumerate(PARTS):
+    t = SCENARIO_TYPE[p]
+    cand = list(type_to_idx_list.get(t, np.array([], dtype=int)))
+    if len(cand)==0 and p in PART_TYPE_SECONDARY:
+        cand = list(type_to_idx_list.get(PART_TYPE_SECONDARY[p], np.array([], dtype=int)))
+    # at least include the chosen one
+    if chosen.get(i_part) is not None and chosen[i_part] not in cand:
+        cand.append(chosen[i_part])
+    # cap negatives
+    cand = cand[: min(12, len(cand))]
+    for j in cand:
+        edge_label_index.append([i_part, shift_fac(j)])
+        edge_label.append(1 if j == chosen[i_part] else 0)
+edge_label_index = torch.tensor(np.array(edge_label_index).T, dtype=torch.long)
+edge_label = torch.tensor(edge_label, dtype=torch.float32)
+
+data = Data(x=X, edge_index=edge_index)
+data.edge_label_index = edge_label_index
+data.edge_label = edge_label
+
+# =========================================================
+# 6) GraphSAGE for link prediction on part→fac
+# =========================================================
 class GraphSAGEModel(nn.Module):
-    """간단한 GraphSAGE 모델."""
-
-    def __init__(self, in_channels: int = 2, hidden_channels: int = 32):
+    def __init__(self, in_channels=4, hidden=64):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.lin = nn.Linear(hidden_channels, 1)
+        self.conv1 = SAGEConv(in_channels, hidden)
+        self.conv2 = SAGEConv(hidden, hidden)
+        self.scorer = nn.Linear(2*hidden, 1)
 
-    def forward(self, data: Data) -> torch.Tensor:
-        x, edge_index = data.x, data.edge_index
-        x = self.conv1(x, edge_index).relu()
-        x = self.conv2(x, edge_index).relu()
-        # 엣지 스코어는 노드 임베딩 쌍을 concat하여 예측
-        src, dst = edge_index
-        h = torch.cat([x[src], x[dst]], dim=1)
-        return self.lin(h).squeeze(-1)
+    def forward(self, x, edge_index, edge_label_index):
+        h = self.conv1(x, edge_index).relu()
+        h = self.conv2(h, edge_index).relu()
+        src, dst = edge_label_index
+        z = torch.cat([h[src], h[dst]], dim=1)
+        return self.scorer(z).squeeze(-1)  # raw logits
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = GraphSAGEModel(in_channels=data.x.shape[1], hidden=64).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+criterion = nn.BCEWithLogitsLoss()
 
-# 4. 강화학습 환경 -------------------------------------------------------------
+data = data.to(device)
+for ep in range(1, 51):
+    model.train(); opt.zero_grad()
+    logits = model(data.x, data.edge_index, data.edge_label_index)
+    loss = criterion(logits, data.edge_label)
+    loss.backward(); opt.step()
+    if ep % 10 == 0 or ep == 1:
+        with torch.no_grad():
+            prob = torch.sigmoid(logits)
+            pred = (prob >= 0.5).float()
+            acc = (pred == data.edge_label).float().mean().item()
+        print(f"[GNN] epoch {ep:02d}  loss={loss.item():.4f}  acc={acc:.3f}")
 
+# Get GNN scores for all candidate edges (CPU dict)
+model.eval()
+with torch.no_grad():
+    gnn_logits = model(data.x, data.edge_index, data.edge_label_index)
+    gnn_prob = torch.sigmoid(gnn_logits).detach().cpu().numpy()
+edge_pairs = data.edge_label_index.detach().cpu().numpy().T
+gnn_scores: Dict[Tuple[int,int], float] = {}
+for (src_idx, dst_idx), p in zip(edge_pairs, gnn_prob):
+    # map homogeneous dst back to facility index
+    fac_idx = int(dst_idx - num_part)
+    gnn_scores[(int(src_idx), fac_idx)] = float(p)
+
+# =========================================================
+# 7) RL environment (global plan with distance + gnn score)
+# =========================================================
+def dist_map_build() -> Dict[Tuple[int,int], float]:
+    dmap = {}
+    for i_part in range(num_part):
+        for j_fac in range(num_fac):
+            d = haversine(
+                # no real part coordinate → use chosen facility distance as 0 ref then facility-to-facility
+                lat[chosen[i_part]], lon[chosen[i_part]],
+                lat[j_fac], lon[j_fac]
+            )
+            dmap[(i_part, j_fac)] = float(d)
+    return dmap
 
 @dataclass
 class FacilityAssignmentEnv:
-    processes: pd.DataFrame
-    facilities: pd.DataFrame
-    dist_map: Dict[Tuple[int, int], float]
-    gnn_scores: Dict[Tuple[int, int], float]
+    num_proc: int
+    num_fac: int
+    dmap: Dict[Tuple[int,int], float]
+    gnn: Dict[Tuple[int,int], float]
+    cand_by_part: Dict[int, List[int]]
 
-    def reset(self) -> int:
-        self.step_idx = 0
-        self.total_distance = 0.0
-        return self.step_idx
+    def reset(self): 
+        self.step_idx = 0; self.total_distance = 0.0; return self.step_idx
 
-    def step(self, action: int) -> Tuple[int, float, bool]:
-        proc_idx = self.step_idx
-        dist = self.dist_map.get((proc_idx, action), 1e6)
-        score = self.gnn_scores.get((proc_idx, action), 0.0)
-        reward = -dist + score
-        self.total_distance += dist
+    def step(self, action_fac_idx: int):
+        p = self.step_idx
+        # invalid action → heavy penalty
+        if action_fac_idx not in self.cand_by_part.get(p, []):
+            d = 1e5; score = 0.0
+        else:
+            d = self.dmap.get((p, action_fac_idx), 1e6)
+            score = self.gnn.get((p, action_fac_idx), 0.0)
+        reward = -d + 100.0*score  # weight score
+        self.total_distance += max(0.0, d if d < 1e5 else 0.0)
         self.step_idx += 1
-        done = self.step_idx >= len(self.processes)
+        done = self.step_idx >= self.num_proc
         return self.step_idx, reward, done
 
-
 class QLearningAgent:
-    def __init__(self, num_processes: int, num_facilities: int,
-                 lr: float = 0.1, gamma: float = 0.9, eps: float = 0.1):
-        self.q = torch.zeros(num_processes, num_facilities)
-        self.lr = lr
-        self.gamma = gamma
-        self.eps = eps
-
-    def select(self, state: int) -> int:
+    def __init__(self, num_proc, num_fac, lr=0.2, gamma=0.9, eps=0.15):
+        self.q = torch.zeros(num_proc, num_fac, dtype=torch.float32)
+        self.lr, self.gamma, self.eps = lr, gamma, eps
+    def select(self, s, cand):
+        if len(cand)==0: return 0
         if torch.rand(1).item() < self.eps:
-            return torch.randint(0, self.q.size(1), (1,)).item()
-        return int(torch.argmax(self.q[state]).item())
-
-    def update(self, s: int, a: int, r: float, ns: int):
-        best_next = torch.max(self.q[ns]) if ns < self.q.size(0) else 0.0
-        td = r + self.gamma * best_next - self.q[s, a]
+            return int(np.random.choice(cand))
+        qrow = self.q[s, cand]
+        return int(cand[int(torch.argmax(qrow).item())])
+    def update(self, s, a, r, ns, cand_next):
+        best_next = torch.max(self.q[ns, cand_next]) if len(cand_next)>0 and ns<self.q.size(0) else torch.tensor(0.0)
+        td = r + self.gamma*best_next - self.q[s, a]
         self.q[s, a] += self.lr * td
 
+# candidate set per part
+cand_by_part: Dict[int, List[int]] = {}
+for i_part, p in enumerate(PARTS):
+    t = SCENARIO_TYPE[p]
+    cand = list(type_to_idx.get(t, np.array([], dtype=int)))
+    if len(cand)==0 and p in PART_TYPE_SECONDARY:
+        cand = list(type_to_idx.get(PART_TYPE_SECONDARY[p], np.array([], dtype=int)))
+    if chosen.get(i_part) is not None and chosen[i_part] not in cand:
+        cand.append(chosen[i_part])
+    cand_by_part[i_part] = sorted(set(cand))
 
-def train_rl(env: FacilityAssignmentEnv, agent: QLearningAgent, episodes: int = 1000) -> None:
+env = FacilityAssignmentEnv(
+    num_proc=num_part, num_fac=num_fac,
+    dmap=dist_map_build(), gnn=gnn_scores, cand_by_part=cand_by_part
+)
+agent = QLearningAgent(num_part, num_fac, lr=0.25, gamma=0.95, eps=0.2)
+
+def train_rl(env, agent, episodes=400):
     for _ in range(episodes):
-        state = env.reset()
-        done = False
+        s = env.reset(); done = False
         while not done:
-            action = agent.select(state)
-            next_state, reward, done = env.step(action)
-            agent.update(state, action, reward, next_state)
-            state = next_state
+            cand = env.cand_by_part.get(s, [])
+            a = agent.select(s, cand if cand else list(range(env.num_fac)))
+            ns, r, done = env.step(a)
+            next_cand = env.cand_by_part.get(ns, []) if not done else []
+            agent.update(s, a, r, ns, next_cand)
+            s = ns
 
+train_rl(env, agent, episodes=600)
 
-def extract_plan(env: FacilityAssignmentEnv, agent: QLearningAgent) -> Tuple[List[Tuple[str, str]], float]:
-    assignments: List[Tuple[str, str]] = []
-    state = env.reset()
-    done = False
+def extract_plan(env, agent) -> Tuple[List[Tuple[str,str]], float]:
+    s = env.reset(); done=False; plan=[]
     while not done:
-        action = int(torch.argmax(agent.q[state]).item())
-        env.step(action)
-        proc_id = env.processes.iloc[state]['id']
-        fac_id = env.facilities.iloc[action]['id']
-        assignments.append((proc_id, fac_id))
-        state += 1
-        done = state >= len(env.processes)
-    return assignments, env.total_distance
+        cand = env.cand_by_part.get(s, [])
+        if len(cand)==0: a = int(torch.argmax(agent.q[s]).item())
+        else:
+            a = int(cand[int(torch.argmax(agent.q[s, cand]).item())])
+        env.step(a)
+        plan.append((PARTS[s], fac.iloc[a]["AssetID"]))
+        s += 1; done = s >= env.num_proc
+    return plan, env.total_distance
 
+assignments, total_km = extract_plan(env, agent)
+print("\n[RL] Assignments:")
+for p, f_id in assignments:
+    print(f" - {p} → {f_id}")
+print(f"[RL] Total travel ≈ {total_km:.2f} km")
 
-# 5. ProductionPlans.xml 생성 ---------------------------------------------------
-
-
-def write_production_plans(assignments: List[Tuple[str, str]], template: str, output: str) -> None:
-    tree = ET.parse(template)
-    root = tree.getroot()
-    plan = root.find('.//Plan')
-    if plan is None:
-        plan = ET.SubElement(root, 'Plan')
+# =========================================================
+# 8) ProductionPlans.xml writer
+# =========================================================
+def write_production_plans(assignments: List[Tuple[str,str]], template: str|None, output: str):
+    if template and os.path.isfile(template):
+        tree = ET.parse(template); root = tree.getroot()
+    else:
+        root = ET.Element("ProductionPlans"); tree = ET.ElementTree(root)
+    plan = root.find(".//Plan") or ET.SubElement(root, "Plan")
     for proc_id, fac_id in assignments:
-        item = ET.SubElement(plan, 'Assignment')
-        ET.SubElement(item, 'Process').text = proc_id
-        ET.SubElement(item, 'Facility').text = fac_id
-    tree.write(output, encoding='utf-8', xml_declaration=True)
+        item = ET.SubElement(plan, "Assignment")
+        ET.SubElement(item, "Process").text = str(proc_id)
+        ET.SubElement(item, "Facility").text = str(fac_id)
+    tree.write(output, encoding="utf-8", xml_declaration=True)
+    print(f"[WRITE] {os.path.abspath(output)}")
 
-
-__all__ = [
-    'parse_mbom',
-    'parse_aas',
-    'build_graph',
-    'GraphSAGEModel',
-    'FacilityAssignmentEnv',
-    'QLearningAgent',
-    'train_rl',
-    'extract_plan',
-    'write_production_plans',
-]
+# 예시 저장 (템플릿 없으면 None)
+OUTPUT_XML = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans.xml")
+write_production_plans(assignments, template=None, output=OUTPUT_XML)
