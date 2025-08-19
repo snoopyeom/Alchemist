@@ -196,10 +196,27 @@ df_aas["Latitude"], df_aas["Longitude"] = lats, lons
 # 4) Hetero graph (part/fac + edges)
 # =========================================================
 # Parts (scenario)
-PARTS = ["Supporter","Bracket","Shaft","Washer","Bush","Sheet"]
+PARTS = [
+    "Supporter","Bracket","Shaft","Washer","Sheet","Hinge Assy",
+    "Bush","Assembly"
+]
 SCENARIO_TYPE = {
     "Supporter":"절삭","Bracket":"절삭","Shaft":"절삭",
     "Washer":"적층제조","Bush":"적층제조","Sheet":"적층제조",
+    "Hinge Assy":"조립","Assembly":"조립",
+}
+
+# Precedence DAG and stages
+PRECEDENCE = {
+    "Washer": [],
+    "Supporter": [], "Bracket": [], "Shaft": [], "Sheet": [], "Hinge Assy": [],
+    "Bush": ["Washer"],
+    "Assembly": ["Supporter","Bracket","Shaft","Washer","Bush","Sheet","Hinge Assy"],
+}
+STAGES = {
+    1: ["Supporter","Bracket","Shaft","Washer","Sheet","Hinge Assy"],
+    2: ["Bush"],
+    3: ["Assembly"],
 }
 
 # Facility typing by text cue
@@ -249,7 +266,9 @@ TXT_FAC = fac[_text_cols].fillna("").astype(str).agg(" ".join, axis=1).str.upper
 PART_SUBTYPE_PREF = {"Supporter": r"(MILL|MILLING|밀링)\b", "Bracket": r"(MILL|MILLING|밀링)\b",
                      "Shaft": r"(LATHE|TURN|선반)\b", "Washer": r"\bFDM\b", "Bush": r"\bFDM\b", "Sheet": r"\bFDM\b"}
 PART_SUBTYPE_AVOID = {"Washer": r"\bPBF\b", "Bush": r"\bPBF\b", "Sheet": r"\bPBF\b"}
-PART_TYPE_SECONDARY = {"Supporter":"절삭","Bracket":"절삭","Shaft":"적층제조","Washer":"적층제조","Bush":"적층제조","Sheet":"적층제조"}
+PART_TYPE_SECONDARY = {"Supporter":"절삭","Bracket":"절삭","Shaft":"적층제조",
+                       "Washer":"적층제조","Bush":"적층제조","Sheet":"적층제조",
+                       "Hinge Assy":"조립","Assembly":"조립"}
 
 def _apply_subtype_preference(cand_idx, part_name):
     if len(cand_idx)==0: return cand_idx, False
@@ -423,12 +442,13 @@ def dist_map_build() -> Dict[Tuple[int,int], float]:
     for i_part in range(num_part):
         for j_fac in range(num_fac):
             d = haversine(
-                # no real part coordinate → use chosen facility distance as 0 ref then facility-to-facility
                 lat[chosen[i_part]], lon[chosen[i_part]],
                 lat[j_fac], lon[j_fac]
             )
             dmap[(i_part, j_fac)] = float(d)
     return dmap
+
+dmap_global = dist_map_build()
 
 @dataclass
 class FacilityAssignmentEnv:
@@ -437,23 +457,78 @@ class FacilityAssignmentEnv:
     dmap: Dict[Tuple[int,int], float]
     gnn: Dict[Tuple[int,int], float]
     cand_by_part: Dict[int, List[int]]
+    fac_lat: np.ndarray
+    fac_lon: np.ndarray
+    fac_ids: List[str]
+    fac_type: pd.Series
+    w_g: float = 100.0
+    w_move: float = 0.2
+    w_chain: float = 0.5
 
-    def reset(self): 
-        self.step_idx = 0; self.total_distance = 0.0; return self.step_idx
+    def reset(self):
+        self.step_idx = 0
+        self.stage_idx = 1
+        self.completed: set[str] = set()
+        self.ready: List[str] = STAGES[self.stage_idx][:]
+        self.cursor = 0
+        self.last_fac_by_part: Dict[str,int] = {}
+        self.total_distance = 0.0
+        self.log: List[dict] = []
+        return self.step_idx
+
+    def _haversine_fac(self, i: int, j: int) -> float:
+        return haversine(self.fac_lat[i], self.fac_lon[i], self.fac_lat[j], self.fac_lon[j])
 
     def step(self, action_fac_idx: int):
-        p = self.step_idx
-        # invalid action → heavy penalty
-        if action_fac_idx not in self.cand_by_part.get(p, []):
+        part_name = self.ready[self.cursor]
+        part_idx = PARTS.index(part_name)
+        current_stage = self.stage_idx
+        cand = self.cand_by_part.get(self.step_idx, [])
+        if action_fac_idx not in cand:
             d = 1e5; score = 0.0
         else:
-            d = self.dmap.get((p, action_fac_idx), 1e6)
-            score = self.gnn.get((p, action_fac_idx), 0.0)
-        reward = -d + 100.0*score  # weight score
-        self.total_distance += max(0.0, d if d < 1e5 else 0.0)
+            d = self.dmap.get((part_idx, action_fac_idx), 1e6)
+            score = self.gnn.get((part_idx, action_fac_idx), 0.0)
+        move_d = 0.0
+        if self.cursor > 0:
+            prev_part = self.ready[self.cursor-1]
+            prev_fac = self.last_fac_by_part.get(prev_part)
+            if prev_fac is not None:
+                move_d = self._haversine_fac(prev_fac, action_fac_idx)
+        chain_d = 0.0
+        for parent in PRECEDENCE.get(part_name, []):
+            if parent in self.last_fac_by_part:
+                chain_d += self._haversine_fac(self.last_fac_by_part[parent], action_fac_idx)
+        reward = -d + self.w_g*score - self.w_move*move_d - self.w_chain*chain_d
+        self.total_distance += d + move_d + chain_d
+        self.log.append({
+            "stage": current_stage,
+            "part": part_name,
+            "facility": self.fac_ids[action_fac_idx],
+            "base_d": d,
+            "bonus": self.w_g*score,
+            "move_d": move_d,
+            "chain_d": chain_d,
+            "reward": reward,
+        })
+        self.last_fac_by_part[part_name] = action_fac_idx
+        self.cursor += 1
         self.step_idx += 1
-        done = self.step_idx >= self.num_proc
+        done = False
+        if self.cursor >= len(self.ready):
+            self.completed.update(self.ready)
+            self.stage_idx += 1
+            self.ready = [p for p in STAGES.get(self.stage_idx, []) if all(pr in self.completed for pr in PRECEDENCE.get(p, []))]
+            self.cursor = 0
+            if self.stage_idx > max(STAGES.keys()) or not self.ready:
+                done = True
         return self.step_idx, reward, done
+
+    def save_log(self, path: str):
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            for row in self.log:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 class QLearningAgent:
     def __init__(self, num_proc, num_fac, lr=0.2, gamma=0.9, eps=0.15):
@@ -479,11 +554,24 @@ for i_part, p in enumerate(PARTS):
         cand = list(type_to_idx.get(PART_TYPE_SECONDARY[p], np.array([], dtype=int)))
     if chosen.get(i_part) is not None and chosen[i_part] not in cand:
         cand.append(chosen[i_part])
-    cand_by_part[i_part] = sorted(set(cand))
+    cand = sorted(set(cand))
+    if len(cand)==0:
+        dists = [dmap_global[(i_part, j)] for j in range(num_fac)]
+        nearest = np.argsort(dists)
+        K_near = min(5, len(nearest))
+        typed = [j for j in nearest[:K_near] if fac_type.iloc[j] == t]
+        if typed:
+            cand = typed
+        else:
+            cand = [int(nearest[0])]
+            print(f"[WARN] {p}: fallback to nearest facility {fac.iloc[nearest[0]]['AssetID']}")
+    cand_by_part[i_part] = cand
 
 env = FacilityAssignmentEnv(
     num_proc=num_part, num_fac=num_fac,
-    dmap=dist_map_build(), gnn=gnn_scores, cand_by_part=cand_by_part
+    dmap=dmap_global, gnn=gnn_scores, cand_by_part=cand_by_part,
+    fac_lat=lat, fac_lon=lon, fac_ids=fac["AssetID"].tolist(), fac_type=fac["fac_type"],
+    w_g=100.0, w_move=0.2, w_chain=0.5,
 )
 agent = QLearningAgent(num_part, num_fac, lr=0.25, gamma=0.95, eps=0.2)
 
@@ -503,13 +591,16 @@ train_rl(env, agent, episodes=600)
 def extract_plan(env, agent) -> Tuple[List[Tuple[str,str]], float]:
     s = env.reset(); done=False; plan=[]
     while not done:
+        part_name = env.ready[env.cursor]
         cand = env.cand_by_part.get(s, [])
-        if len(cand)==0: a = int(torch.argmax(agent.q[s]).item())
+        if len(cand)==0:
+            a = int(torch.argmax(agent.q[s]).item())
         else:
             a = int(cand[int(torch.argmax(agent.q[s, cand]).item())])
         env.step(a)
-        plan.append((PARTS[s], fac.iloc[a]["AssetID"]))
+        plan.append((part_name, fac.iloc[a]["AssetID"]))
         s += 1; done = s >= env.num_proc
+    env.save_log("rl_log.jsonl")
     return plan, env.total_distance
 
 assignments, total_km = extract_plan(env, agent)
@@ -517,6 +608,46 @@ print("\n[RL] Assignments:")
 for p, f_id in assignments:
     print(f" - {p} → {f_id}")
 print(f"[RL] Total travel ≈ {total_km:.2f} km")
+
+def rank_topk(env, k=10):
+    order = STAGES[1][:] + STAGES[2][:] + STAGES[3][:]
+    stage_of = {p:s for s,ps in STAGES.items() for p in ps}
+    results: List[Tuple[float,List[Tuple[str,int]]]] = []
+
+    def dfs(i, plan, fac_by_part, dist_sum):
+        if i == len(order):
+            results.append((dist_sum, plan.copy()))
+            return
+        part = order[i]
+        part_idx = PARTS.index(part)
+        cand = env.cand_by_part[i]
+        for fac_idx in cand:
+            d = env.dmap[(part_idx, fac_idx)]
+            move_d = 0.0
+            if i>0 and stage_of[order[i-1]]==stage_of[part]:
+                prev_fac = plan[-1][1]
+                move_d = env._haversine_fac(prev_fac, fac_idx)
+            chain_d = 0.0
+            for parent in PRECEDENCE.get(part, []):
+                if parent in fac_by_part:
+                    chain_d += env._haversine_fac(fac_by_part[parent], fac_idx)
+            fac_by_part[part] = fac_idx
+            plan.append((part, fac_idx))
+            dfs(i+1, plan, fac_by_part, dist_sum + d + move_d + chain_d)
+            plan.pop()
+            fac_by_part.pop(part)
+
+    dfs(0, [], {}, 0.0)
+    results.sort(key=lambda x: x[0])
+    top = results[:k]
+    print("\n[RL] 상위 경로 (거리 기준):")
+    for rank, (dist, pl) in enumerate(top, 1):
+        print(f" {rank}위: {dist:.2f} km")
+        for part, fac_idx in pl:
+            print(f"   - {part} → {env.fac_ids[fac_idx]}")
+    return top
+
+rank_topk(env, k=10)
 
 # =========================================================
 # 8) ProductionPlans.xml writer
