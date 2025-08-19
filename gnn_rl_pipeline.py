@@ -920,7 +920,7 @@ def write_production_plans(assignments: List[Tuple[str,str]], template: str|None
 # 예시 저장 (템플릿 없으면 None)
 OUTPUT_XML = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans.xml")
 write_production_plans(assignments, template=None, output=OUTPUT_XML)
-topk_results = rollout_topk_with_rl(env, agent, k=10)
+topk_results = rollout_topk_with_rl(env, agent, k=10, use_flow_as_cost=False)
 plans_for_aas = [(plan, flow) for _, flow, plan in topk_results]
 out_aas_xml = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans_AAS.xml")
 write_aas_production_plans(plans_for_aas, df_proc, df_aas, out_aas_xml)
