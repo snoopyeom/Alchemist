@@ -815,21 +815,38 @@ for p, f_id in assignments:
 print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:.2f} km")
 
 def visualize_sequence_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
-    """플랜 방문 순서를 직선 폴리라인으로 시각화"""
+    """
+    방문 순서를 '도로 경로' 기반 polyline으로 시각화한다.
+    - 인접한 두 방문지 (i -> i+1)마다 KakaoDirectionsProvider.pair_path() 호출
+    - pair_path 실패 시 직선으로 폴백
+    """
     id_to_idx = {fid: i for i, fid in enumerate(env.fac_ids)}
-    m = folium.Map(location=[float(env.fac_lat.mean()), float(env.fac_lon.mean())], zoom_start=7)
-    coords: List[Tuple[float,float]] = []
+    m = folium.Map(location=[float(env.fac_lat.mean()), float(env.fac_lon.mean())], zoom_start=9)
+
+    # 마커 먼저 표시
+    coords_seq = []
     for part, fac_id in plan:
         idx = id_to_idx.get(fac_id)
         if idx is None:
             continue
         lat_i = float(env.fac_lat[idx]); lon_i = float(env.fac_lon[idx])
-        coords.append((lat_i, lon_i))
+        coords_seq.append((lat_i, lon_i, part, fac_id))
         folium.Marker([lat_i, lon_i], popup=f"{part} → {fac_id}").add_to(m)
-    if len(coords) >= 2:
-        folium.PolyLine(coords, color=color, weight=3).add_to(m)
+
+    # 도로 경로 polyline (인접 쌍마다)
+    for (lat1, lon1, part1, fac1), (lat2, lon2, part2, fac2) in zip(coords_seq, coords_seq[1:]):
+        try:
+            path_coords = provider.pair_path(lat1, lon1, lat2, lon2)  # Kakao Directions
+            if path_coords and len(path_coords) >= 2:
+                folium.PolyLine(path_coords, weight=4, tooltip=f"{part1}→{part2} (도로경로)").add_to(m)
+            else:
+                # 폴백: 직선
+                folium.PolyLine([(lat1, lon1), (lat2, lon2)], weight=3, tooltip=f"{part1}→{part2} (직선)").add_to(m)
+        except Exception:
+            folium.PolyLine([(lat1, lon1), (lat2, lon2)], weight=3, tooltip=f"{part1}→{part2} (직선)").add_to(m)
+
     m.save(output_html)
-    print(f"[SEQ-MAP] {os.path.abspath(output_html)}")
+    print(f"[SEQ-MAP:ROAD] {os.path.abspath(output_html)}")
 
 def visualize_material_flow(plan: List[Tuple[str, str]], env, output_html: str):
     """물류 흐름 레그를 개별 선으로 시각화"""
@@ -996,7 +1013,12 @@ def write_production_plans(assignments: List[Tuple[str,str]], template: str|None
     print(f"[WRITE] {os.path.abspath(output)}")
 
 # 상위 경로 탐색 및 AAS XML 저장
-topk_results = rollout_topk_with_rl(env, agent, k=10, use_flow_as_cost=False)
+topk_results = rollout_topk_with_rl(
+    env, agent, k=10,
+    use_flow_as_cost=False,
+    save_sequence_map=True,   # 도로 경로 시퀀스 지도도 저장
+    save_flow_map=True
+)
 plans_for_aas = [(plan, flow) for _, flow, plan in topk_results]
 out_aas_xml = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans_AAS.xml")
 write_aas_production_plans(plans_for_aas, df_proc, df_aas, out_aas_xml)
