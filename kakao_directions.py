@@ -3,7 +3,7 @@ import json
 import time
 import math
 import hashlib
-from typing import Tuple
+from typing import Tuple, List
 from pathlib import Path
 
 import requests
@@ -113,3 +113,44 @@ class KakaoDirectionsProvider:
         minutes = (km / 40.0) * 60.0
         self._save_cache(key, km, minutes)
         return km, minutes
+
+    def pair_path(self, lat1: float, lon1: float, lat2: float, lon2: float,
+                  max_retries: int = 3) -> List[Tuple[float, float]]:
+        """도로 경로 좌표열을 반환한다. 실패 시 직선으로 폴백."""
+        if not self.api_key:
+            return [(lat1, lon1), (lat2, lon2)]
+        url = "https://apis-navi.kakaomobility.com/v1/directions"
+        headers = {
+            "Authorization": f"KakaoAK {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        params = {
+            "origin": f"{lon1},{lat1}",
+            "destination": f"{lon2},{lat2}",
+            "priority": self.priority,
+            "summary": "false",
+        }
+        backoff = 0.5
+        for attempt in range(max_retries + 1):
+            try:
+                r = requests.get(url, headers=headers, params=params, timeout=5)
+                if r.status_code == 200:
+                    routes = r.json().get("routes", [])
+                    if routes:
+                        coords: List[Tuple[float, float]] = []
+                        for sec in routes[0].get("sections", []):
+                            for road in sec.get("roads", []):
+                                vs = road.get("vertexes", [])
+                                for i in range(0, len(vs), 2):
+                                    coords.append((float(vs[i+1]), float(vs[i])))
+                        if coords:
+                            return coords
+                if r.status_code in (401, 403, 429, 400):
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            except requests.exceptions.RequestException:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+        return [(lat1, lon1), (lat2, lon2)]
