@@ -154,7 +154,12 @@ df_aas, failed_files = parse_aas_folder(AAS_DIR)
 # =========================================================
 # 3) Geocoding (Kakao) + address cleaning
 # =========================================================
-KAKAO_API_KEY = "ac473e33b35d06d474e45ab59d2b69d0"  # TODO: put your key
+KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "")
+if not KAKAO_API_KEY:
+    raise RuntimeError(
+        "KAKAO_API_KEY 환경 변수가 설정되지 않았습니다. "
+        "경로 계산을 위해 유효한 Kakao API 키를 등록하세요."
+    )
 def clean_address(addr: str) -> str:
     if addr is None or pd.isna(addr): return ""
     s = str(addr).strip()
@@ -250,7 +255,7 @@ def haversine(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
     return R*2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
 
-provider = KakaoDirectionsProvider()
+provider = KakaoDirectionsProvider(api_key=KAKAO_API_KEY)
 
 # fac↔fac KNN travel edges
 K = max(1, min(5, len(fac)-1))
