@@ -75,9 +75,10 @@ class KakaoDirectionsProvider:
         if cached is not None:
             return cached
         if not self.api_key:
-            km = _haversine(lat1, lon1, lat2, lon2)
-            minutes = (km / 40.0) * 60.0
-            return km, minutes
+            raise RuntimeError(
+                "Kakao API 키가 설정되지 않았습니다. 환경 변수 KAKAO_API_KEY를 설정하거나 "
+                "KakaoDirectionsProvider(api_key=...)로 전달하세요."
+            )
         url = "https://apis-navi.kakaomobility.com/v1/directions"
         headers = {
             "Authorization": f"KakaoAK {self.api_key}",
@@ -118,7 +119,10 @@ class KakaoDirectionsProvider:
                   max_retries: int = 3) -> List[Tuple[float, float]]:
         """도로 경로 좌표열을 반환한다. 실패 시 직선으로 폴백."""
         if not self.api_key:
-            return [(lat1, lon1), (lat2, lon2)]
+            raise RuntimeError(
+                "Kakao API 키가 설정되지 않아 도로 경로를 계산할 수 없습니다. "
+                "환경 변수 KAKAO_API_KEY를 설정하거나 KakaoDirectionsProvider(api_key=...)로 전달하세요."
+            )
         url = "https://apis-navi.kakaomobility.com/v1/directions"
         headers = {
             "Authorization": f"KakaoAK {self.api_key}",
