@@ -860,11 +860,12 @@ def visualize_material_flow(plan: List[Tuple[str, str]], env, output_html: str):
             continue
         i = id_to_idx[leg["from_fac"]]
         j = id_to_idx[leg["to_fac"]]
+        path_coords = provider.pair_path(
+            float(env.fac_lat[i]), float(env.fac_lon[i]),
+            float(env.fac_lat[j]), float(env.fac_lon[j])
+        )
         folium.PolyLine(
-            [
-                (float(env.fac_lat[i]), float(env.fac_lon[i])),
-                (float(env.fac_lat[j]), float(env.fac_lon[j])),
-            ],
+            path_coords,
             weight=4,
             tooltip=f"{leg['label']} ~ {km:.2f} km"
         ).add_to(m)
