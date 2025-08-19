@@ -235,7 +235,7 @@ lon = fac["Longitude"].astype(float).to_numpy()
 fac_type = pd.Series("미분류", index=fac.index, dtype=str)
 if "ManufacturerName" in fac.columns:
     fac_type[fac["ManufacturerName"].astype(str).str.strip().eq("건솔루션")] = "조립"
-TXT = fac.fillna("").astype(str).apply(lambda s: " ".join(s), axis=1).str.upper()
+TXT = fac.fillna("").astype(str).agg(" ".join, axis=1).str.upper()
 MAP = {
     "적층제조": r"(FDM|PBF|3D\s*PRINT|적층|ADDITIVE)",
     "절삭"   : r"(CNC|MILL|밀링|선반|LATHE|절삭|다이캐스팅|MACHINING|머시닝)",
