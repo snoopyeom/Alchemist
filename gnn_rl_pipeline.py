@@ -14,6 +14,8 @@ import os, re, time, math, xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+from kakao_directions import KakaoDirectionsProvider
+
 from aas_xml import write_aas_production_plans
 
 import numpy as np
@@ -248,19 +250,32 @@ def haversine(lat1, lon1, lat2, lon2):
     a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
     return R*2*np.arctan2(np.sqrt(a), np.sqrt(1-a))
 
+provider = KakaoDirectionsProvider()
+
 # fac↔fac KNN travel edges
 K = max(1, min(5, len(fac)-1))
-D = haversine(lat[:,None], lon[:,None], lat[None,:], lon[None,:])
-np.fill_diagonal(D, np.inf)
+FF_KM = np.full((len(fac), len(fac)), np.inf, dtype=float)
+FF_MIN = np.full((len(fac), len(fac)), np.inf, dtype=float)
+for i in range(len(fac)):
+    for j in range(len(fac)):
+        if i == j:
+            continue
+        km, mins = provider.pair_cost(lat[i], lon[i], lat[j], lon[j])
+        FF_KM[i, j] = km
+        FF_MIN[i, j] = mins
+metric = os.getenv("ROAD_COST_METRIC", "time")
+D = FF_MIN if metric == "time" else FF_KM
 nn_idx = np.argpartition(D, K, axis=1)[:, :K]
 
 edges_ff, attrs_ff = [], []
 for i in range(len(fac)):
     for j in nn_idx[i]:
-        if i==j: continue
-        dkm = float(D[i,j]); tmin = (dkm/40.0)*60.0
-        edges_ff += [[i,j],[j,i]]
-        attrs_ff  += [[dkm,tmin],[dkm,tmin]]
+        if i == j:
+            continue
+        dkm = float(FF_KM[i, j])
+        tmin = float(FF_MIN[i, j])
+        edges_ff += [[i, j], [j, i]]
+        attrs_ff += [[dkm, tmin], [dkm, tmin]]
 
 # part→first facility (type/subtype rules)
 type_to_idx = {t: np.where((fac["fac_type"]==t).values)[0] for t in sorted(fac["fac_type"].unique())}
@@ -440,31 +455,37 @@ for (src_idx, dst_idx), p in zip(edge_pairs, gnn_prob):
 # =========================================================
 # 7) RL environment (global plan with distance + gnn score)
 # =========================================================
-def dist_map_build() -> Dict[Tuple[int,int], float]:
-    dmap = {}
+def dist_map_build() -> Tuple[Dict[Tuple[int,int], float], Dict[Tuple[int,int], float]]:
+    dmap: Dict[Tuple[int,int], float] = {}
+    tmap: Dict[Tuple[int,int], float] = {}
     for i_part in range(num_part):
         for j_fac in range(num_fac):
-            d = haversine(
+            km, mins = provider.pair_cost(
                 lat[chosen[i_part]], lon[chosen[i_part]],
                 lat[j_fac], lon[j_fac]
             )
-            dmap[(i_part, j_fac)] = float(d)
-    return dmap
+            dmap[(i_part, j_fac)] = float(km)
+            tmap[(i_part, j_fac)] = float(mins)
+    return dmap, tmap
 
-dmap_global = dist_map_build()
+dmap_global, tmap_global = dist_map_build()
 
 @dataclass
 class FacilityAssignmentEnv:
     num_proc: int
     num_fac: int
     dmap: Dict[Tuple[int,int], float]
+    tmap: Dict[Tuple[int,int], float]
     gnn: Dict[Tuple[int,int], float]
     cand_by_part: Dict[int, List[int]]
     fac_lat: np.ndarray
     fac_lon: np.ndarray
     fac_ids: List[str]
     fac_type: pd.Series
-    alpha: float = 1.0
+    ff_km: np.ndarray
+    ff_min: np.ndarray
+    alpha_km: float = 1.0
+    alpha_min: float = 0.0
     gamma: float = 100.0
 
     def reset(self):
@@ -475,13 +496,15 @@ class FacilityAssignmentEnv:
         self.cursor = 0
         self.last_fac_by_part: Dict[str,int] = {}
         self.total_distance = 0.0
+        self.total_duration = 0.0
         self.flow_distance = 0.0
+        self.flow_minutes = 0.0
         self.flow_legs: List[Dict[str, object]] = []
         self.log: List[dict] = []
         return self.step_idx
 
-    def _haversine_fac(self, i: int, j: int) -> float:
-        return haversine(self.fac_lat[i], self.fac_lon[i], self.fac_lat[j], self.fac_lon[j])
+    def _cost_fac(self, i: int, j: int) -> Tuple[float, float]:
+        return float(self.ff_km[i, j]), float(self.ff_min[i, j])
 
     def step(self, action_fac_idx: int):
         part_name = self.ready[self.cursor]
@@ -489,87 +512,118 @@ class FacilityAssignmentEnv:
         current_stage = self.stage_idx
         cand = self.cand_by_part.get(self.step_idx, [])
         if action_fac_idx not in cand:
-            d = 1e5
+            d = t = 1e5
             score = 0.0
         else:
             d = self.dmap.get((part_idx, action_fac_idx), 1e6)
+            t = self.tmap.get((part_idx, action_fac_idx), 1e6)
             score = self.gnn.get((part_idx, action_fac_idx), 0.0)
-        move_d = 0.0
+        move_d = move_t = 0.0
         if self.cursor > 0:
             prev_part = self.ready[self.cursor-1]
             prev_fac = self.last_fac_by_part.get(prev_part)
             if prev_fac is not None:
-                move_d = self._haversine_fac(prev_fac, action_fac_idx)
-        chain_d = 0.0
+                move_d, move_t = self._cost_fac(prev_fac, action_fac_idx)
+        chain_d = chain_t = 0.0
         for parent in PRECEDENCE.get(part_name, []):
             if parent in self.last_fac_by_part:
-                chain_d += self._haversine_fac(self.last_fac_by_part[parent], action_fac_idx)
+                dtmp, ttmp = self._cost_fac(self.last_fac_by_part[parent], action_fac_idx)
+                chain_d += dtmp
+                chain_t += ttmp
         self.total_distance += d + move_d + chain_d
+        self.total_duration += t + move_t + chain_t
 
         self.last_fac_by_part[part_name] = action_fac_idx
 
         delta_flow_km = 0.0
+        delta_flow_min = 0.0
         new_legs: List[Dict[str, object]] = []
         if part_name == "Bush":
             w_idx = self.last_fac_by_part.get("Washer")
             if w_idx is not None:
-                km = 0.0 if w_idx == action_fac_idx else self._haversine_fac(w_idx, action_fac_idx)
+                if w_idx == action_fac_idx:
+                    km, mins = 0.0, 0.0
+                else:
+                    km, mins = self._cost_fac(w_idx, action_fac_idx)
                 new_legs.append({
                     "label": "Washer→Bush",
                     "from_fac": self.fac_ids[w_idx],
                     "to_fac": self.fac_ids[action_fac_idx],
                     "km": km,
+                    "min": mins,
                 })
                 delta_flow_km += km
+                delta_flow_min += mins
         elif part_name == "Assembly":
             asm_idx = action_fac_idx
             for p in ["Supporter","Bracket","Shaft","Sheet","Hinge Assy"]:
                 if p in self.last_fac_by_part:
                     f_idx = self.last_fac_by_part[p]
-                    km = 0.0 if f_idx == asm_idx else self._haversine_fac(f_idx, asm_idx)
+                    if f_idx == asm_idx:
+                        km, mins = 0.0, 0.0
+                    else:
+                        km, mins = self._cost_fac(f_idx, asm_idx)
                     new_legs.append({
                         "label": f"{p}→Assembly",
                         "from_fac": self.fac_ids[f_idx],
                         "to_fac": self.fac_ids[asm_idx],
                         "km": km,
+                        "min": mins,
                     })
                     delta_flow_km += km
+                    delta_flow_min += mins
             if "Bush" in self.last_fac_by_part:
                 b_idx = self.last_fac_by_part["Bush"]
-                km = 0.0 if b_idx == asm_idx else self._haversine_fac(b_idx, asm_idx)
+                if b_idx == asm_idx:
+                    km, mins = 0.0, 0.0
+                else:
+                    km, mins = self._cost_fac(b_idx, asm_idx)
                 new_legs.append({
                     "label": "Bush→Assembly",
                     "from_fac": self.fac_ids[b_idx],
                     "to_fac": self.fac_ids[asm_idx],
                     "km": km,
+                    "min": mins,
                 })
                 delta_flow_km += km
+                delta_flow_min += mins
             elif "Washer" in self.last_fac_by_part:
                 w_idx = self.last_fac_by_part["Washer"]
-                km = 0.0 if w_idx == asm_idx else self._haversine_fac(w_idx, asm_idx)
+                if w_idx == asm_idx:
+                    km, mins = 0.0, 0.0
+                else:
+                    km, mins = self._cost_fac(w_idx, asm_idx)
                 new_legs.append({
                     "label": "Washer→Assembly",
                     "from_fac": self.fac_ids[w_idx],
                     "to_fac": self.fac_ids[asm_idx],
                     "km": km,
+                    "min": mins,
                 })
                 delta_flow_km += km
+                delta_flow_min += mins
                 print("[WARN] Bush 미배정으로 Washer→Assembly 거리만 계산")
 
-        reward = -self.alpha * delta_flow_km + self.gamma * score
+        reward = -self.alpha_km * delta_flow_km - self.alpha_min * delta_flow_min + self.gamma * score
         self.flow_distance += delta_flow_km
+        self.flow_minutes += delta_flow_min
         self.flow_legs.extend(new_legs)
         self.log.append({
             "stage": current_stage,
             "part": part_name,
             "facility": self.fac_ids[action_fac_idx],
             "base_d": d,
+            "base_t": t,
             "gnn_score": score,
             "move_d": move_d,
+            "move_t": move_t,
             "chain_d": chain_d,
+            "chain_t": chain_t,
             "delta_flow_km": delta_flow_km,
+            "delta_flow_min": delta_flow_min,
             "new_flow_legs": new_legs,
             "flow_distance": self.flow_distance,
+            "flow_minutes": self.flow_minutes,
             "reward": reward,
         })
         self.cursor += 1
@@ -592,6 +646,7 @@ class FacilityAssignmentEnv:
             summary = {
                 "flow_summary": {
                     "total_flow_km": self.flow_distance,
+                    "total_flow_min": self.flow_minutes,
                     "legs": self.flow_legs,
                 }
             }
@@ -612,49 +667,69 @@ def compute_material_flow_distance(plan: List[Tuple[str, str]], env: FacilityAss
     for p in ["Supporter", "Bracket", "Shaft", "Sheet", "Hinge Assy"]:
         if p in part_to_idx:
             f_idx = part_to_idx[p]
-            km = 0.0 if f_idx == asm_idx else env._haversine_fac(f_idx, asm_idx)
+            if f_idx == asm_idx:
+                km, mins = 0.0, 0.0
+            else:
+                km, mins = env._cost_fac(f_idx, asm_idx)
             legs.append({
                 "label": f"{p}→Assembly",
                 "from_fac": env.fac_ids[f_idx],
                 "to_fac": env.fac_ids[asm_idx],
                 "km": km,
+                "min": mins,
             })
             total += km
     washer_idx = part_to_idx.get("Washer")
     bush_idx = part_to_idx.get("Bush")
     if washer_idx is not None and bush_idx is not None:
-        km = 0.0 if washer_idx == bush_idx else env._haversine_fac(washer_idx, bush_idx)
+        if washer_idx == bush_idx:
+            km, mins = 0.0, 0.0
+        else:
+            km, mins = env._cost_fac(washer_idx, bush_idx)
         legs.append({
             "label": "Washer→Bush",
             "from_fac": env.fac_ids[washer_idx],
             "to_fac": env.fac_ids[bush_idx],
             "km": km,
+            "min": mins,
         })
         total += km
-        km = 0.0 if bush_idx == asm_idx else env._haversine_fac(bush_idx, asm_idx)
+        if bush_idx == asm_idx:
+            km, mins = 0.0, 0.0
+        else:
+            km, mins = env._cost_fac(bush_idx, asm_idx)
         legs.append({
             "label": "Bush→Assembly",
             "from_fac": env.fac_ids[bush_idx],
             "to_fac": env.fac_ids[asm_idx],
             "km": km,
+            "min": mins,
         })
         total += km
     elif washer_idx is not None and bush_idx is None:
-        km = 0.0 if washer_idx == asm_idx else env._haversine_fac(washer_idx, asm_idx)
+        if washer_idx == asm_idx:
+            km, mins = 0.0, 0.0
+        else:
+            km, mins = env._cost_fac(washer_idx, asm_idx)
         legs.append({
             "label": "Washer→Assembly",
             "from_fac": env.fac_ids[washer_idx],
             "to_fac": env.fac_ids[asm_idx],
             "km": km,
+            "min": mins,
         })
         total += km
     elif bush_idx is not None and washer_idx is None:
-        km = 0.0 if bush_idx == asm_idx else env._haversine_fac(bush_idx, asm_idx)
+        if bush_idx == asm_idx:
+            km, mins = 0.0, 0.0
+        else:
+            km, mins = env._cost_fac(bush_idx, asm_idx)
         legs.append({
             "label": "Bush→Assembly",
             "from_fac": env.fac_ids[bush_idx],
             "to_fac": env.fac_ids[asm_idx],
             "km": km,
+            "min": mins,
         })
         total += km
     return total, legs
@@ -698,9 +773,10 @@ for i_part, p in enumerate(PARTS):
 
 env = FacilityAssignmentEnv(
     num_proc=num_part, num_fac=num_fac,
-    dmap=dmap_global, gnn=gnn_scores, cand_by_part=cand_by_part,
+    dmap=dmap_global, tmap=tmap_global, gnn=gnn_scores, cand_by_part=cand_by_part,
     fac_lat=lat, fac_lon=lon, fac_ids=fac["AssetID"].tolist(), fac_type=fac["fac_type"],
-    alpha=1.0, gamma=100.0,
+    ff_km=FF_KM, ff_min=FF_MIN,
+    alpha_km=1.0, alpha_min=1.0, gamma=100.0,
 )
 agent = QLearningAgent(num_part, num_fac, lr=0.25, gamma=0.95, eps=0.2)
 
