@@ -462,9 +462,8 @@ class FacilityAssignmentEnv:
     fac_lon: np.ndarray
     fac_ids: List[str]
     fac_type: pd.Series
-    w_g: float = 100.0
-    w_move: float = 0.2
-    w_chain: float = 0.5
+    alpha: float = 1.0
+    gamma: float = 100.0
 
     def reset(self):
         self.step_idx = 0
@@ -474,6 +473,8 @@ class FacilityAssignmentEnv:
         self.cursor = 0
         self.last_fac_by_part: Dict[str,int] = {}
         self.total_distance = 0.0
+        self.flow_distance = 0.0
+        self.flow_legs: List[Dict[str, object]] = []
         self.log: List[dict] = []
         return self.step_idx
 
@@ -486,7 +487,8 @@ class FacilityAssignmentEnv:
         current_stage = self.stage_idx
         cand = self.cand_by_part.get(self.step_idx, [])
         if action_fac_idx not in cand:
-            d = 1e5; score = 0.0
+            d = 1e5
+            score = 0.0
         else:
             d = self.dmap.get((part_idx, action_fac_idx), 1e6)
             score = self.gnn.get((part_idx, action_fac_idx), 0.0)
@@ -500,19 +502,74 @@ class FacilityAssignmentEnv:
         for parent in PRECEDENCE.get(part_name, []):
             if parent in self.last_fac_by_part:
                 chain_d += self._haversine_fac(self.last_fac_by_part[parent], action_fac_idx)
-        reward = -d + self.w_g*score - self.w_move*move_d - self.w_chain*chain_d
         self.total_distance += d + move_d + chain_d
+
+        self.last_fac_by_part[part_name] = action_fac_idx
+
+        delta_flow_km = 0.0
+        new_legs: List[Dict[str, object]] = []
+        if part_name == "Bush":
+            w_idx = self.last_fac_by_part.get("Washer")
+            if w_idx is not None:
+                km = 0.0 if w_idx == action_fac_idx else self._haversine_fac(w_idx, action_fac_idx)
+                new_legs.append({
+                    "label": "Washer→Bush",
+                    "from_fac": self.fac_ids[w_idx],
+                    "to_fac": self.fac_ids[action_fac_idx],
+                    "km": km,
+                })
+                delta_flow_km += km
+        elif part_name == "Assembly":
+            asm_idx = action_fac_idx
+            for p in ["Supporter","Bracket","Shaft","Sheet","Hinge Assy"]:
+                if p in self.last_fac_by_part:
+                    f_idx = self.last_fac_by_part[p]
+                    km = 0.0 if f_idx == asm_idx else self._haversine_fac(f_idx, asm_idx)
+                    new_legs.append({
+                        "label": f"{p}→Assembly",
+                        "from_fac": self.fac_ids[f_idx],
+                        "to_fac": self.fac_ids[asm_idx],
+                        "km": km,
+                    })
+                    delta_flow_km += km
+            if "Bush" in self.last_fac_by_part:
+                b_idx = self.last_fac_by_part["Bush"]
+                km = 0.0 if b_idx == asm_idx else self._haversine_fac(b_idx, asm_idx)
+                new_legs.append({
+                    "label": "Bush→Assembly",
+                    "from_fac": self.fac_ids[b_idx],
+                    "to_fac": self.fac_ids[asm_idx],
+                    "km": km,
+                })
+                delta_flow_km += km
+            elif "Washer" in self.last_fac_by_part:
+                w_idx = self.last_fac_by_part["Washer"]
+                km = 0.0 if w_idx == asm_idx else self._haversine_fac(w_idx, asm_idx)
+                new_legs.append({
+                    "label": "Washer→Assembly",
+                    "from_fac": self.fac_ids[w_idx],
+                    "to_fac": self.fac_ids[asm_idx],
+                    "km": km,
+                })
+                delta_flow_km += km
+                print("[WARN] Bush 미배정으로 Washer→Assembly 거리만 계산")
+
+        reward = -self.alpha * delta_flow_km + self.gamma * score
+        self.flow_distance += delta_flow_km
+        self.flow_legs.extend(new_legs)
         self.log.append({
             "stage": current_stage,
             "part": part_name,
             "facility": self.fac_ids[action_fac_idx],
             "base_d": d,
-            "bonus": self.w_g*score,
+            "gnn_score": score,
             "move_d": move_d,
             "chain_d": chain_d,
+            "delta_flow_km": delta_flow_km,
+            "new_flow_legs": new_legs,
+            "flow_distance": self.flow_distance,
             "reward": reward,
         })
-        self.last_fac_by_part[part_name] = action_fac_idx
         self.cursor += 1
         self.step_idx += 1
         done = False
@@ -530,6 +587,75 @@ class FacilityAssignmentEnv:
         with open(path, "w", encoding="utf-8") as f:
             for row in self.log:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            summary = {
+                "flow_summary": {
+                    "total_flow_km": self.flow_distance,
+                    "legs": self.flow_legs,
+                }
+            }
+            f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+def compute_material_flow_distance(plan: List[Tuple[str, str]], env: FacilityAssignmentEnv) -> Tuple[float, List[Dict[str, object]]]:
+    id_to_idx = {fid: i for i, fid in enumerate(env.fac_ids)}
+    part_to_idx: Dict[str, int] = {}
+    for part, fid in plan:
+        idx = id_to_idx.get(fid)
+        if idx is not None:
+            part_to_idx[part] = idx
+    legs: List[Dict[str, object]] = []
+    total = 0.0
+    asm_idx = part_to_idx.get("Assembly")
+    if asm_idx is None:
+        raise ValueError("Assembly facility not assigned")
+    for p in ["Supporter", "Bracket", "Shaft", "Sheet", "Hinge Assy"]:
+        if p in part_to_idx:
+            f_idx = part_to_idx[p]
+            km = 0.0 if f_idx == asm_idx else env._haversine_fac(f_idx, asm_idx)
+            legs.append({
+                "label": f"{p}→Assembly",
+                "from_fac": env.fac_ids[f_idx],
+                "to_fac": env.fac_ids[asm_idx],
+                "km": km,
+            })
+            total += km
+    washer_idx = part_to_idx.get("Washer")
+    bush_idx = part_to_idx.get("Bush")
+    if washer_idx is not None and bush_idx is not None:
+        km = 0.0 if washer_idx == bush_idx else env._haversine_fac(washer_idx, bush_idx)
+        legs.append({
+            "label": "Washer→Bush",
+            "from_fac": env.fac_ids[washer_idx],
+            "to_fac": env.fac_ids[bush_idx],
+            "km": km,
+        })
+        total += km
+        km = 0.0 if bush_idx == asm_idx else env._haversine_fac(bush_idx, asm_idx)
+        legs.append({
+            "label": "Bush→Assembly",
+            "from_fac": env.fac_ids[bush_idx],
+            "to_fac": env.fac_ids[asm_idx],
+            "km": km,
+        })
+        total += km
+    elif washer_idx is not None and bush_idx is None:
+        km = 0.0 if washer_idx == asm_idx else env._haversine_fac(washer_idx, asm_idx)
+        legs.append({
+            "label": "Washer→Assembly",
+            "from_fac": env.fac_ids[washer_idx],
+            "to_fac": env.fac_ids[asm_idx],
+            "km": km,
+        })
+        total += km
+    elif bush_idx is not None and washer_idx is None:
+        km = 0.0 if bush_idx == asm_idx else env._haversine_fac(bush_idx, asm_idx)
+        legs.append({
+            "label": "Bush→Assembly",
+            "from_fac": env.fac_ids[bush_idx],
+            "to_fac": env.fac_ids[asm_idx],
+            "km": km,
+        })
+        total += km
+    return total, legs
 
 class QLearningAgent:
     def __init__(self, num_proc, num_fac, lr=0.2, gamma=0.9, eps=0.15):
@@ -572,7 +698,7 @@ env = FacilityAssignmentEnv(
     num_proc=num_part, num_fac=num_fac,
     dmap=dmap_global, gnn=gnn_scores, cand_by_part=cand_by_part,
     fac_lat=lat, fac_lon=lon, fac_ids=fac["AssetID"].tolist(), fac_type=fac["fac_type"],
-    w_g=100.0, w_move=0.2, w_chain=0.5,
+    alpha=1.0, gamma=100.0,
 )
 agent = QLearningAgent(num_part, num_fac, lr=0.25, gamma=0.95, eps=0.2)
 
@@ -602,13 +728,13 @@ def extract_plan(env, agent) -> Tuple[List[Tuple[str,str]], float]:
         plan.append((part_name, fac.iloc[a]["AssetID"]))
         s += 1; done = s >= env.num_proc
     env.save_log("rl_log.jsonl")
-    return plan, env.total_distance
+    return plan, env.flow_distance
 
-assignments, total_km = extract_plan(env, agent)
+assignments, flow_km = extract_plan(env, agent)
 print("\n[RL] Assignments:")
 for p, f_id in assignments:
     print(f" - {p} → {f_id}")
-print(f"[RL] Total travel ≈ {total_km:.2f} km")
+print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:.2f} km")
 
 def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
     """Folium을 이용해 플랜 경로를 시각화하여 HTML로 저장"""
@@ -627,7 +753,7 @@ def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, colo
     m.save(output_html)
     print(f"[MAP] {os.path.abspath(output_html)}")
 
-def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95):
+def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95, use_flow_as_cost: bool = True):
     """Q-테이블을 이용해 롤아웃으로 상위 경로를 순차적으로 탐색.
 
     Args:
@@ -643,7 +769,7 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
     선택을 하게 된다.
     """
     banned: set[Tuple[str, ...]] = set()
-    top: List[Tuple[float, List[Tuple[str, str]]]] = []
+    top: List[Tuple[float, float, List[Tuple[str, str]]]] = []
     colors = [
         "blue", "red", "green", "purple", "orange",
         "darkred", "lightblue", "black", "lightgreen", "gray",
@@ -652,7 +778,7 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
     rank = 1
     current_tau = tau
     while len(top) < k:
-        results: List[Tuple[float, List[Tuple[str, str]]]] = []
+        results: List[Tuple[float, float, List[Tuple[str, str]]]] = []
         for _ in range(n_samples):
             s = env.reset()
             done = False
@@ -674,13 +800,14 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
             path_key = tuple(fac_id for _, fac_id in plan)
             if path_key in banned:
                 continue
-            cost = -total_reward  # 비용 = -보상 합
-            results.append((cost, plan))
-        unique: Dict[Tuple[str, ...], Tuple[float, List[Tuple[str, str]]]] = {}
-        for cost, plan in results:
+            flow_km = env.flow_distance
+            cost = flow_km if use_flow_as_cost else -total_reward
+            results.append((cost, flow_km, plan))
+        unique: Dict[Tuple[str, ...], Tuple[float, float, List[Tuple[str, str]]]] = {}
+        for cost, flow_km, plan in results:
             key = tuple(fac_id for _, fac_id in plan)
             if key not in unique or cost < unique[key][0]:
-                unique[key] = (cost, plan)
+                unique[key] = (cost, flow_km, plan)
         if not unique:
             # 샘플링으로 새로운 경로가 없으면 무작위로라도 생성
             for _ in range(1000):
@@ -700,15 +827,17 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
                     total_reward += r
                 key = tuple(fac_id for _, fac_id in plan)
                 if key not in banned:
-                    unique[key] = (-total_reward, plan)
+                    flow_km = env.flow_distance
+                    cost = flow_km if use_flow_as_cost else -total_reward
+                    unique[key] = (cost, flow_km, plan)
                     break
             if not unique:
                 break
         best_key = min(unique, key=lambda k: unique[k][0])
-        best_cost, best_plan = unique[best_key]
+        best_cost, best_flow, best_plan = unique[best_key]
         banned.add(best_key)
-        top.append((best_cost, best_plan))
-        print(f" {rank}위: {best_cost:.2f}")
+        top.append((best_cost, best_flow, best_plan))
+        print(f" {rank}위: cost={best_cost:.2f}, flow={best_flow:.2f} km")
         for part, fac_id in best_plan:
             print(f"   - {part} → {fac_id}")
         out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
