@@ -71,8 +71,6 @@ def write_aas_production_plans(
     output_path: str,
 ) -> None:
     env = ET.Element(f"{{{NS_AAS}}}environment")
-    env.set("xmlns:aas", NS_AAS)
-    env.set("xmlns:xs", NS_XS)
 
     shells = ET.SubElement(env, f"{{{NS_AAS}}}assetAdministrationShells")
     shell = ET.SubElement(shells, f"{{{NS_AAS}}}assetAdministrationShell")
