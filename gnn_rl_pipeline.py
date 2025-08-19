@@ -6,7 +6,7 @@ Hybrid pipeline:
 - Hetero graph (part/fac + travel/start_at/to_assembly)
 - Homogeneous conversion for GraphSAGE
 - Q-learning global assignment
-- ProductionPlans.xml writer
+- ProductionPlans_AAS.xml writer
 """
 
 from __future__ import annotations
@@ -820,6 +820,10 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
         "blue", "red", "green", "purple", "orange",
         "darkred", "lightblue", "black", "lightgreen", "gray",
     ]
+    base_dir = os.path.dirname(MBOM_PATH)
+    flow_dir = os.path.join(base_dir, "plan_flow")
+    if save_flow_map:
+        os.makedirs(flow_dir, exist_ok=True)
     print("\n[RL-Policy] 상위 경로 (순차적 제거, 비용 기준):")
     rank = 1
     current_tau = tau
@@ -886,15 +890,12 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
         print(f" {rank}위: cost={best_cost:.2f}, flow={best_flow:.2f} km")
         for part, fac_id in best_plan:
             print(f"   - {part} → {fac_id}")
-        out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
-        write_production_plans(best_plan, template=None, output=out_xml)
         color = colors[(rank - 1) % len(colors)]
-        base_dir = os.path.dirname(MBOM_PATH)
         if save_sequence_map:
             out_html_seq = os.path.join(base_dir, f"plan_route_top{rank}.html")
             visualize_sequence_route(best_plan, env, out_html_seq, color=color)
         if save_flow_map:
-            out_html_flow = os.path.join(base_dir, f"plan_flow_top{rank}.html")
+            out_html_flow = os.path.join(flow_dir, f"plan_flow_top{rank}.html")
             visualize_material_flow(best_plan, env, out_html_flow)
         rank += 1
         current_tau *= tau_decay
@@ -917,9 +918,7 @@ def write_production_plans(assignments: List[Tuple[str,str]], template: str|None
     tree.write(output, encoding="utf-8", xml_declaration=True)
     print(f"[WRITE] {os.path.abspath(output)}")
 
-# 예시 저장 (템플릿 없으면 None)
-OUTPUT_XML = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans.xml")
-write_production_plans(assignments, template=None, output=OUTPUT_XML)
+# 상위 경로 탐색 및 AAS XML 저장
 topk_results = rollout_topk_with_rl(env, agent, k=10, use_flow_as_cost=False)
 plans_for_aas = [(plan, flow) for _, flow, plan in topk_results]
 out_aas_xml = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans_AAS.xml")
