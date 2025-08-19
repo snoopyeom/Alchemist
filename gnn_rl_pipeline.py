@@ -736,8 +736,8 @@ for p, f_id in assignments:
     print(f" - {p} → {f_id}")
 print(f"[RL] Legacy distance ≈ {env.total_distance:.2f} km, flow ≈ {flow_km:.2f} km")
 
-def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
-    """Folium을 이용해 플랜 경로를 시각화하여 HTML로 저장"""
+def visualize_sequence_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
+    """플랜 방문 순서를 직선 폴리라인으로 시각화"""
     id_to_idx = {fid: i for i, fid in enumerate(env.fac_ids)}
     m = folium.Map(location=[float(env.fac_lat.mean()), float(env.fac_lon.mean())], zoom_start=7)
     coords: List[Tuple[float,float]] = []
@@ -751,9 +751,53 @@ def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, colo
     if len(coords) >= 2:
         folium.PolyLine(coords, color=color, weight=3).add_to(m)
     m.save(output_html)
-    print(f"[MAP] {os.path.abspath(output_html)}")
+    print(f"[SEQ-MAP] {os.path.abspath(output_html)}")
 
-def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95, use_flow_as_cost: bool = True):
+def visualize_material_flow(plan: List[Tuple[str, str]], env, output_html: str):
+    """물류 흐름 레그를 개별 선으로 시각화"""
+    id_to_idx = {fid: i for i, fid in enumerate(env.fac_ids)}
+    total_km, legs = compute_material_flow_distance(plan, env)
+
+    m = folium.Map(
+        location=[float(env.fac_lat.mean()), float(env.fac_lon.mean())],
+        zoom_start=9
+    )
+
+    used: set[str] = set()
+    for leg in legs:
+        used.add(leg["from_fac"])
+        used.add(leg["to_fac"])
+    for fid in used:
+        idx = id_to_idx.get(fid)
+        if idx is None:
+            continue
+        folium.Marker([
+            float(env.fac_lat[idx]),
+            float(env.fac_lon[idx])
+        ], popup=fid).add_to(m)
+
+    for leg in legs:
+        km = float(leg["km"])
+        if km <= 0:
+            continue
+        i = id_to_idx[leg["from_fac"]]
+        j = id_to_idx[leg["to_fac"]]
+        folium.PolyLine(
+            [
+                (float(env.fac_lat[i]), float(env.fac_lon[i])),
+                (float(env.fac_lat[j]), float(env.fac_lon[j])),
+            ],
+            weight=4,
+            tooltip=f"{leg['label']} ~ {km:.2f} km"
+        ).add_to(m)
+
+    m.save(output_html)
+    print(f"[FLOW-MAP] total_flow={total_km:.2f} km → {os.path.abspath(output_html)}")
+
+def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.95,
+                         use_flow_as_cost: bool = True,
+                         save_sequence_map: bool = False,
+                         save_flow_map: bool = True):
     """Q-테이블을 이용해 롤아웃으로 상위 경로를 순차적으로 탐색.
 
     Args:
@@ -842,9 +886,14 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=3000, tau=1.0, tau_decay=0.
             print(f"   - {part} → {fac_id}")
         out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
         write_production_plans(best_plan, template=None, output=out_xml)
-        out_html = os.path.join(os.path.dirname(MBOM_PATH), f"plan_route_top{rank}.html")
         color = colors[(rank - 1) % len(colors)]
-        visualize_plan_route(best_plan, env, out_html, color=color)
+        base_dir = os.path.dirname(MBOM_PATH)
+        if save_sequence_map:
+            out_html_seq = os.path.join(base_dir, f"plan_route_top{rank}.html")
+            visualize_sequence_route(best_plan, env, out_html_seq, color=color)
+        if save_flow_map:
+            out_html_flow = os.path.join(base_dir, f"plan_flow_top{rank}.html")
+            visualize_material_flow(best_plan, env, out_html_flow)
         rank += 1
         current_tau *= tau_decay
     return top
