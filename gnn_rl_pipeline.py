@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import SAGEConv
+import folium
 
 # =========================================================
 # 0) PATHS: relative-first; AAS falls back to absolute
@@ -609,6 +610,23 @@ for p, f_id in assignments:
     print(f" - {p} → {f_id}")
 print(f"[RL] Total travel ≈ {total_km:.2f} km")
 
+def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, color: str = "blue"):
+    """Folium을 이용해 플랜 경로를 시각화하여 HTML로 저장"""
+    id_to_idx = {fid: i for i, fid in enumerate(env.fac_ids)}
+    m = folium.Map(location=[float(env.fac_lat.mean()), float(env.fac_lon.mean())], zoom_start=7)
+    coords: List[Tuple[float,float]] = []
+    for part, fac_id in plan:
+        idx = id_to_idx.get(fac_id)
+        if idx is None:
+            continue
+        lat_i = float(env.fac_lat[idx]); lon_i = float(env.fac_lon[idx])
+        coords.append((lat_i, lon_i))
+        folium.Marker([lat_i, lon_i], popup=f"{part} → {fac_id}").add_to(m)
+    if len(coords) >= 2:
+        folium.PolyLine(coords, color=color, weight=3).add_to(m)
+    m.save(output_html)
+    print(f"[MAP] {os.path.abspath(output_html)}")
+
 def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
     """Q-테이블을 이용해 롤아웃으로 상위 경로 탐색"""
     results: List[Tuple[float, List[Tuple[str, str]]]] = []
@@ -635,8 +653,15 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
             total_reward += r
         cost = -total_reward  # 비용 = -보상 합
         results.append((cost, plan))
-    results.sort(key=lambda x: x[0])
-    top = results[:k]
+    # 중복 경로 제거 (최소 비용 유지)
+    unique: Dict[Tuple[Tuple[str,str], ...], float] = {}
+    for cost, plan in results:
+        key = tuple(plan)
+        if key not in unique or cost < unique[key]:
+            unique[key] = cost
+    dedup = [(c, list(k)) for k, c in unique.items()]
+    dedup.sort(key=lambda x: x[0])
+    top = dedup[:k]
     print("\n[RL-Policy] 상위 경로 (롤아웃 기반, 비용 기준):")
     for rank, (cost, pl) in enumerate(top, 1):
         print(f" {rank}위: {cost:.2f}")
@@ -644,6 +669,8 @@ def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
             print(f"   - {part} → {fac_id}")
         out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
         write_production_plans(pl, template=None, output=out_xml)
+        out_html = os.path.join(os.path.dirname(MBOM_PATH), f"plan_route_top{rank}.html")
+        visualize_plan_route(pl, env, out_html, color="blue")
     return top
 
 
