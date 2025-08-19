@@ -609,45 +609,43 @@ for p, f_id in assignments:
     print(f" - {p} → {f_id}")
 print(f"[RL] Total travel ≈ {total_km:.2f} km")
 
-def rank_topk(env, k=10):
-    order = STAGES[1][:] + STAGES[2][:] + STAGES[3][:]
-    stage_of = {p:s for s,ps in STAGES.items() for p in ps}
-    results: List[Tuple[float,List[Tuple[str,int]]]] = []
-
-    def dfs(i, plan, fac_by_part, dist_sum):
-        if i == len(order):
-            results.append((dist_sum, plan.copy()))
-            return
-        part = order[i]
-        part_idx = PARTS.index(part)
-        cand = env.cand_by_part[i]
-        for fac_idx in cand:
-            d = env.dmap[(part_idx, fac_idx)]
-            move_d = 0.0
-            if i>0 and stage_of[order[i-1]]==stage_of[part]:
-                prev_fac = plan[-1][1]
-                move_d = env._haversine_fac(prev_fac, fac_idx)
-            chain_d = 0.0
-            for parent in PRECEDENCE.get(part, []):
-                if parent in fac_by_part:
-                    chain_d += env._haversine_fac(fac_by_part[parent], fac_idx)
-            fac_by_part[part] = fac_idx
-            plan.append((part, fac_idx))
-            dfs(i+1, plan, fac_by_part, dist_sum + d + move_d + chain_d)
-            plan.pop()
-            fac_by_part.pop(part)
-
-    dfs(0, [], {}, 0.0)
+def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
+    """Q-테이블을 이용해 롤아웃으로 상위 경로 탐색"""
+    results: List[Tuple[float, List[Tuple[str, str]]]] = []
+    # 여러 번 샘플링하여 다양한 플랜 생성
+    for _ in range(n_samples):
+        s = env.reset()
+        done = False
+        plan: List[Tuple[str, str]] = []
+        total_reward = 0.0
+        while not done:
+            part_name = env.ready[env.cursor]
+            cand = env.cand_by_part.get(s, [])
+            # 후보가 없으면 전체 시설에서 소프트맥스로 선택
+            if len(cand) == 0:
+                probs = torch.softmax(agent.q[s] / tau, dim=0).numpy()
+                a = int(np.random.choice(np.arange(env.num_fac), p=probs))
+            else:
+                # 후보에 대해서만 소프트맥스 확률 계산
+                q_row = agent.q[s, cand] / tau
+                probs = torch.softmax(q_row, dim=0).numpy()
+                a = int(np.random.choice(cand, p=probs))
+            s, r, done = env.step(a)
+            plan.append((part_name, env.fac_ids[a]))
+            total_reward += r
+        cost = -total_reward  # 비용 = -보상 합
+        results.append((cost, plan))
     results.sort(key=lambda x: x[0])
     top = results[:k]
-    print("\n[RL] 상위 경로 (거리 기준):")
-    for rank, (dist, pl) in enumerate(top, 1):
-        print(f" {rank}위: {dist:.2f} km")
-        for part, fac_idx in pl:
-            print(f"   - {part} → {env.fac_ids[fac_idx]}")
+    print("\n[RL-Policy] 상위 경로 (롤아웃 기반, 비용 기준):")
+    for rank, (cost, pl) in enumerate(top, 1):
+        print(f" {rank}위: {cost:.2f}")
+        for part, fac_id in pl:
+            print(f"   - {part} → {fac_id}")
+        out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
+        write_production_plans(pl, template=None, output=out_xml)
     return top
 
-rank_topk(env, k=10)
 
 # =========================================================
 # 8) ProductionPlans.xml writer
@@ -668,3 +666,4 @@ def write_production_plans(assignments: List[Tuple[str,str]], template: str|None
 # 예시 저장 (템플릿 없으면 None)
 OUTPUT_XML = os.path.join(os.path.dirname(MBOM_PATH), "ProductionPlans.xml")
 write_production_plans(assignments, template=None, output=OUTPUT_XML)
+rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25)
