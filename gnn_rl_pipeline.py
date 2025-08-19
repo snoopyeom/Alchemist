@@ -628,49 +628,59 @@ def visualize_plan_route(plan: List[Tuple[str,str]], env, output_html: str, colo
     print(f"[MAP] {os.path.abspath(output_html)}")
 
 def rollout_topk_with_rl(env, agent, k=10, n_samples=800, tau=0.25):
-    """Q-테이블을 이용해 롤아웃으로 상위 경로 탐색"""
-    results: List[Tuple[float, List[Tuple[str, str]]]] = []
-    # 여러 번 샘플링하여 다양한 플랜 생성
-    for _ in range(n_samples):
-        s = env.reset()
-        done = False
-        plan: List[Tuple[str, str]] = []
-        total_reward = 0.0
-        while not done:
-            part_name = env.ready[env.cursor]
-            cand = env.cand_by_part.get(s, [])
-            # 후보가 없으면 전체 시설에서 소프트맥스로 선택
-            if len(cand) == 0:
-                probs = torch.softmax(agent.q[s] / tau, dim=0).numpy()
-                a = int(np.random.choice(np.arange(env.num_fac), p=probs))
-            else:
-                # 후보에 대해서만 소프트맥스 확률 계산
-                q_row = agent.q[s, cand] / tau
-                probs = torch.softmax(q_row, dim=0).numpy()
-                a = int(np.random.choice(cand, p=probs))
-            s, r, done = env.step(a)
-            plan.append((part_name, env.fac_ids[a]))
-            total_reward += r
-        cost = -total_reward  # 비용 = -보상 합
-        results.append((cost, plan))
-    # 중복 경로 제거 (최소 비용 유지)
-    unique: Dict[Tuple[Tuple[str,str], ...], float] = {}
-    for cost, plan in results:
-        key = tuple(plan)
-        if key not in unique or cost < unique[key]:
-            unique[key] = cost
-    dedup = [(c, list(k)) for k, c in unique.items()]
-    dedup.sort(key=lambda x: x[0])
-    top = dedup[:k]
-    print("\n[RL-Policy] 상위 경로 (롤아웃 기반, 비용 기준):")
-    for rank, (cost, pl) in enumerate(top, 1):
-        print(f" {rank}위: {cost:.2f}")
-        for part, fac_id in pl:
+    """Q-테이블을 이용해 롤아웃으로 상위 경로를 순차적으로 탐색"""
+    banned: set[Tuple[Tuple[str, str], ...]] = set()
+    top: List[Tuple[float, List[Tuple[str, str]]]] = []
+    colors = [
+        "blue", "red", "green", "purple", "orange",
+        "darkred", "lightblue", "black", "lightgreen", "gray",
+    ]
+    print("\n[RL-Policy] 상위 경로 (순차적 제거, 비용 기준):")
+    for rank in range(1, k + 1):
+        results: List[Tuple[float, List[Tuple[str, str]]]] = []
+        for _ in range(n_samples):
+            s = env.reset()
+            done = False
+            plan: List[Tuple[str, str]] = []
+            total_reward = 0.0
+            while not done:
+                part_name = env.ready[env.cursor]
+                cand = env.cand_by_part.get(s, [])
+                if len(cand) == 0:
+                    probs = torch.softmax(agent.q[s] / tau, dim=0).numpy()
+                    a = int(np.random.choice(np.arange(env.num_fac), p=probs))
+                else:
+                    q_row = agent.q[s, cand] / tau
+                    probs = torch.softmax(q_row, dim=0).numpy()
+                    a = int(np.random.choice(cand, p=probs))
+                s, r, done = env.step(a)
+                plan.append((part_name, env.fac_ids[a]))
+                total_reward += r
+            key = tuple(plan)
+            if key in banned:
+                continue
+            cost = -total_reward  # 비용 = -보상 합
+            results.append((cost, plan))
+        unique: Dict[Tuple[Tuple[str, str], ...], float] = {}
+        for cost, plan in results:
+            key = tuple(plan)
+            if key not in unique or cost < unique[key]:
+                unique[key] = cost
+        if not unique:
+            break
+        best_key = min(unique, key=unique.get)
+        best_cost = unique[best_key]
+        best_plan = list(best_key)
+        banned.add(best_key)
+        top.append((best_cost, best_plan))
+        print(f" {rank}위: {best_cost:.2f}")
+        for part, fac_id in best_plan:
             print(f"   - {part} → {fac_id}")
         out_xml = os.path.join(os.path.dirname(MBOM_PATH), f"ProductionPlans_top{rank}.xml")
-        write_production_plans(pl, template=None, output=out_xml)
+        write_production_plans(best_plan, template=None, output=out_xml)
         out_html = os.path.join(os.path.dirname(MBOM_PATH), f"plan_route_top{rank}.html")
-        visualize_plan_route(pl, env, out_html, color="blue")
+        color = colors[(rank - 1) % len(colors)]
+        visualize_plan_route(best_plan, env, out_html, color=color)
     return top
 
 
