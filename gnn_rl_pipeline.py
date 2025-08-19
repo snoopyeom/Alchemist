@@ -154,12 +154,9 @@ df_aas, failed_files = parse_aas_folder(AAS_DIR)
 # =========================================================
 # 3) Geocoding (Kakao) + address cleaning
 # =========================================================
-KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "")
-if not KAKAO_API_KEY:
-    raise RuntimeError(
-        "KAKAO_API_KEY 환경 변수가 설정되지 않았습니다. "
-        "경로 계산을 위해 유효한 Kakao API 키를 등록하세요."
-    )
+# 환경 변수를 사용하지 않고 코드에서 직접 API 키를 지정한다.
+# 실제 서비스 배포 시에는 보안을 위해 별도의 관리가 필요하다.
+KAKAO_API_KEY = "d0e4ffa3a5813e7672a39d379b1a4592"
 def clean_address(addr: str) -> str:
     if addr is None or pd.isna(addr): return ""
     s = str(addr).strip()
